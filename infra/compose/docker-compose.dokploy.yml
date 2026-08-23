@@ -1,0 +1,180 @@
+name: rakazo
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rakazo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-rakazo}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-rakazo} -d ${POSTGRES_DB:-rakazo}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # The supervisor creates persistent sibling containers from a host image named
+  # rakazo/computer:local. Dokploy deploys with `docker compose --build`, so this
+  # initializer checks the host daemon at runtime and builds the image only when
+  # it is missing. Normal API/web deployments therefore keep the same image and
+  # bot container IDs instead of rebuilding and replacing every bot container.
+  #
+  # To intentionally upgrade the computer image, remove/rebuild the host image
+  # during maintenance after stopping or resetting existing computers so Rakazo
+  # provisions and records new container IDs.
+  # Also exclude containers labelled rakazo.managed=true from Docker cleanup;
+  # stopped containers are Rakazo's normal persistent "asleep" state.
+  computer:
+    image: docker:27-cli
+    pull_policy: if_not_present
+    command:
+      - sh
+      - -c
+      - docker image inspect rakazo/computer:local >/dev/null 2>&1 || docker build -t rakazo/computer:local /computer
+    restart: "no"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../sandboxes/computer:/computer:ro
+
+  # Owns the Docker socket; spawns/manages bot computer containers
+  supervisor:
+    build:
+      context: ../..
+      dockerfile: infra/sandboxes/supervisor/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      SUPERVISOR_HOST: "0.0.0.0"
+      SUPERVISOR_PORT: "7091"
+      DOCKER_SOCKET: /var/run/docker.sock
+      RAKAZO_COMPUTER_IMAGE: rakazo/computer:local
+      SANDBOX_SCREEN_NETWORK: internal
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - appdata:/data
+    depends_on:
+      computer:
+        condition: service_completed_successfully
+      data-init:
+        condition: service_completed_successfully
+
+  data-init:
+    image: busybox:1
+    command: ["chown", "-R", "1000:1000", "/data"]
+    restart: "no"
+    volumes:
+      - appdata:/data
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/compose/Dockerfile
+    restart: unless-stopped
+    init: true
+    command: bash -lc "pnpm --filter @rakazo/db exec prisma migrate deploy && pnpm --filter @rakazo/api start"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-rakazo}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rakazo}
+      DATA_DIR: /data
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      WAKEUP_DRIVER: graphile
+      AGENT_RUNTIME: pi
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL}
+      WEB_ORIGIN: ${WEB_ORIGIN}
+      API_URL: ${API_URL}
+      RAKAZO_HOST: ${RAKAZO_HOST}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      SIGNUPS_ENABLED: ${SIGNUPS_ENABLED:-true}
+      SIGNUP_ALLOWLIST: ${SIGNUP_ALLOWLIST:-}
+      GIT_SHA: ${GIT_SHA:-}
+    expose:
+      - "3100"
+    volumes:
+      - appdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      supervisor:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/compose/Dockerfile
+    restart: unless-stopped
+    init: true
+    command: ["pnpm", "--filter", "@rakazo/worker", "start"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-rakazo}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rakazo}
+      DATA_DIR: /data
+      SANDBOX_PROVIDER: docker
+      SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      WAKEUP_DRIVER: graphile
+      AGENT_RUNTIME: pi
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+    volumes:
+      - appdata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      supervisor:
+        condition: service_started
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/compose/Dockerfile
+    restart: unless-stopped
+    init: true
+    command:
+      [
+        "pnpm",
+        "--filter",
+        "@rakazo/web",
+        "preview",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "5173",
+      ]
+    environment:
+      NODE_ENV: production
+      API_PROXY_TARGET: http://api:3100
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      RAKAZO_HOST: ${RAKAZO_HOST:-localhost}
+    expose:
+      - "5173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  appdata:
