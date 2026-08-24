@@ -3,6 +3,7 @@ import type {
   Bot,
   BotSection,
   ComputerMode,
+  ComputerReleaseReason,
   ComputerStatus,
   Group,
   Me,
@@ -20,6 +21,10 @@ import {
   ATTACHMENT_ALLOWED_MIME_TYPES,
   ATTACHMENT_MAX_BYTES,
   ATTACHMENT_MAX_COUNT,
+  BOT_DESCRIPTION_MAX_LENGTH,
+  BOT_NAME_MAX_LENGTH,
+  BOT_TITLE_MAX_LENGTH,
+  normalizeCreateBotProfile,
 } from "@rakazo/contracts";
 import {
   abortableDelay,
@@ -71,6 +76,7 @@ import {
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ArtifactFileCard } from "../components/ArtifactFileCard";
+import { AskCard } from "../components/AskCard";
 import { SkillDraftCard } from "../components/teach/SkillDraftCard";
 import { TeachCaptureOverlay } from "../components/teach/TeachCaptureOverlay";
 import { TeachComputerSection } from "../components/teach/TeachComputerSection";
@@ -102,6 +108,11 @@ import { WorkspaceSearchResults } from "./WorkspaceSearch";
 
 const BotContextMenu = lazy(() =>
   import("./BotContextMenu").then((module) => ({ default: module.BotContextMenu })),
+);
+const AccountSettingsOverlay = lazy(() =>
+  import("./AccountSettingsOverlay").then((module) => ({
+    default: module.AccountSettingsOverlay,
+  })),
 );
 const ModelSettingsOverlay = lazy(() =>
   import("./ModelSettingsOverlay").then((module) => ({ default: module.ModelSettingsOverlay })),
@@ -168,6 +179,7 @@ export function ShellPage() {
   const [teachBusy, setTeachBusy] = useState(false);
   const [computer, setComputer] = useState<ComputerStatus | null>(null);
   const [pluginsOpen, setPluginsOpen] = useState(false);
+  const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
   const [memorySettingsOpen, setMemorySettingsOpen] = useState(false);
   const [memoryProviderConfig, setMemoryProviderConfig] = useState<
@@ -1077,9 +1089,12 @@ export function ShellPage() {
 
   async function createGroup(input: { name: string; botIds: string[] }) {
     const group = await rpc.groups.create(input);
-    setPanel(null);
-    await refreshBots();
+    setGroups((current) =>
+      current.some((item) => item.id === group.id) ? current : [group, ...current],
+    );
     navigate(`/app/g/${group.id}`);
+    setPanel(null);
+    await refreshBots().catch(() => undefined);
   }
 
   async function createBot(input: {
@@ -1089,16 +1104,16 @@ export function ShellPage() {
     computerMode: ComputerMode;
   }) {
     const bot = await rpc.bots.create({
-      name: input.name.trim(),
-      title: input.title,
-      description: input.description,
-      instructions: input.description,
+      ...normalizeCreateBotProfile(input),
       notifyOnFinish: true,
       computerMode: input.computerMode,
     });
-    await refreshBots();
+    setBots((current) =>
+      current.some((item) => item.id === bot.id) ? current : [bot, ...current],
+    );
     navigate(`/app/${bot.id}`);
     setPanel(null);
+    await refreshBots().catch(() => undefined);
   }
 
   async function bootComputer({
@@ -1209,10 +1224,10 @@ export function ShellPage() {
     setComputerOpen(true);
   }
 
-  async function releaseComputer() {
+  async function releaseComputer(reason?: ComputerReleaseReason) {
     if (!active) return;
     setComputerOpen(false);
-    await rpc.computer.release({ botId: active.id }).catch(() => undefined);
+    await rpc.computer.release({ botId: active.id, reason }).catch(() => undefined);
     await refreshThread(active.id);
   }
 
@@ -1460,6 +1475,18 @@ export function ShellPage() {
             <div className="absolute bottom-14 left-3 right-3 rounded-2xl border border-[#2A2A2F] bg-[#1A1A1D] p-2 shadow-[0_22px_50px_rgba(0,0,0,.55)]">
               <button
                 type="button"
+                aria-label="Settings"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setAccountSettingsOpen(true);
+                }}
+                className="flex w-full items-center gap-3 rounded-[11px] px-3 py-2.5 hover:bg-[#232327]"
+              >
+                <span className="text-[#9A9AA0]">⚙</span>
+                <span className="flex-1 text-left text-[14.5px] text-[#ECECEE]">Settings</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   setMenuOpen(false);
                   setModelsOpen(true);
@@ -1518,6 +1545,7 @@ export function ShellPage() {
           ) : null}
           <button
             type="button"
+            data-testid="user-menu-trigger"
             onClick={() => setMenuOpen((v) => !v)}
             className="flex items-center gap-[11px] px-[18px] py-3.5"
           >
@@ -1673,16 +1701,27 @@ export function ShellPage() {
             panel !== "group-settings" ? (
               <div className="mb-4 flex items-center justify-between">
                 <span className="text-[13.5px] text-[#85858A]">
-                  {active ? (computer?.state ?? active.status) : "group"}
+                  {panel === "settings"
+                    ? "Settings"
+                    : active
+                      ? (computer?.state ?? active.status)
+                      : "group"}
                 </span>
                 <div className="flex gap-3.5">
-                  <button
-                    type="button"
-                    aria-label="Bot settings"
-                    onClick={() => setPanel("settings")}
-                  >
-                    <Settings size={16} strokeWidth={1.7} />
-                  </button>
+                  {active ? (
+                    <button
+                      type="button"
+                      aria-label={panel === "settings" ? "Show computer" : "Show settings"}
+                      onClick={() => setPanel(panel === "settings" ? "computer" : "settings")}
+                      className={
+                        panel === "settings"
+                          ? "text-[#ECECEE]"
+                          : "text-[#85858A] hover:text-[#ECECEE]"
+                      }
+                    >
+                      <Settings size={16} strokeWidth={1.7} />
+                    </button>
+                  ) : null}
                   <button type="button" aria-label="Close panel" onClick={() => setPanel(null)}>
                     <X size={16} strokeWidth={1.8} />
                   </button>
@@ -1737,14 +1776,10 @@ export function ShellPage() {
                           : computerLabel(computer?.mode, active.name)}
                   </span>
                   {hasControl ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={() => void releaseComputer()}
-                    >
-                      Release
-                    </Button>
+                    <ComputerReleaseActions
+                      takeoverRequested={computer?.takeoverRequested ?? false}
+                      onRelease={releaseComputer}
+                    />
                   ) : (
                     <Button
                       type="button"
@@ -1816,7 +1851,7 @@ export function ShellPage() {
               <CreateGroupForm
                 bots={bots}
                 onCancel={() => setPanel(null)}
-                onCreate={(input) => void createGroup(input)}
+                onCreate={(input) => createGroup(input)}
               />
             ) : null}
             {panel === "group-settings" && activeGroup ? (
@@ -1825,22 +1860,29 @@ export function ShellPage() {
                 group={activeGroup}
                 bots={bots}
                 onSave={async (input) => {
-                  await rpc.groups.update({ groupId: activeGroup.id, ...input });
-                  await refreshBots();
-                  await refreshGroupThread(activeGroup.id);
+                  const updated = await rpc.groups.update({ groupId: activeGroup.id, ...input });
+                  setGroups((current) =>
+                    current.map((group) => (group.id === updated.id ? updated : group)),
+                  );
                   setPanel(null);
+                  await Promise.all([refreshBots(), refreshGroupThread(activeGroup.id)]).catch(
+                    () => undefined,
+                  );
                 }}
                 onRemove={async () => {
                   await rpc.groups.remove({ groupId: activeGroup.id });
+                  const remainingGroups = groups.filter((group) => group.id !== activeGroup.id);
+                  setGroups(remainingGroups);
                   setPanel(null);
-                  await refreshBots();
+                  navigate(firstThreadRoute(bots, remainingGroups), { replace: true });
+                  await refreshBots().catch(() => undefined);
                 }}
               />
             ) : null}
             {panel === "create" ? (
               <CreateBotForm
                 onCancel={() => setPanel(null)}
-                onCreate={(input) => void createBot(input)}
+                onCreate={(input) => createBot(input)}
               />
             ) : null}
             {panel === "settings" && active ? (
@@ -2117,6 +2159,13 @@ export function ShellPage() {
       </Suspense>
 
       <Suspense fallback={null}>
+        {accountSettingsOpen ? (
+          <AccountSettingsOverlay
+            name={userName}
+            email={session.data?.user.email}
+            onClose={() => setAccountSettingsOpen(false)}
+          />
+        ) : null}
         {modelsOpen ? <ModelSettingsOverlay onClose={() => setModelsOpen(false)} /> : null}
         {voiceOpen ? (
           <VoiceSettingsOverlay
@@ -2192,14 +2241,10 @@ export function ShellPage() {
               {recordingSkill ? (
                 <TeachStopButton busy={teachBusy} onStop={stopTeaching} />
               ) : hasControl ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void releaseComputer()}
-                >
-                  Release
-                </Button>
+                <ComputerReleaseActions
+                  takeoverRequested={computer?.takeoverRequested ?? false}
+                  onRelease={releaseComputer}
+                />
               ) : (
                 <Button
                   type="button"
@@ -2651,6 +2696,32 @@ function applyThreadEvent(
   }
 }
 
+function ComputerReleaseActions({
+  takeoverRequested,
+  onRelease,
+}: {
+  takeoverRequested: boolean;
+  onRelease: (reason?: ComputerReleaseReason) => Promise<void>;
+}) {
+  if (!takeoverRequested) {
+    return (
+      <Button type="button" variant="outline" size="sm" onClick={() => void onRelease()}>
+        Release
+      </Button>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2">
+      <Button type="button" variant="outline" size="sm" onClick={() => void onRelease("skipped")}>
+        Skip
+      </Button>
+      <Button type="button" size="sm" onClick={() => void onRelease("done")}>
+        I’m done
+      </Button>
+    </div>
+  );
+}
+
 function ToolSteps({
   steps,
   currentIndex,
@@ -3021,108 +3092,6 @@ const MessageView = memo(function MessageView({
   );
 });
 
-type AskBlock = Extract<ThreadMessage["blocks"][number], { kind: "ask" }>;
-
-function AskCard({
-  block,
-  canAnswer,
-  onAnswer,
-}: {
-  block: AskBlock;
-  canAnswer: boolean;
-  onAnswer: (text: string) => Promise<void>;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [answer, setAnswer] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-
-  async function submitAnswer(value: string) {
-    const text = value.trim();
-    if (!text || submitting) return;
-    setSubmitting(true);
-    try {
-      await onAnswer(text);
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <div className="max-w-[74%] rounded-[20px] border border-[#242428] bg-[#141417] px-5 py-[17px]">
-      <div className="text-[15.5px] leading-[1.5] text-[#ECECEE]">
-        <ChatMarkdown>{block.text}</ChatMarkdown>
-      </div>
-      {block.detail ? (
-        <pre className="mt-3 rounded-xl bg-[#0E0E10] px-3.5 py-3 font-mono text-[12.5px] leading-[1.7] text-[#85858A]">
-          {block.detail}
-        </pre>
-      ) : null}
-      {block.status === "answered" ? (
-        <div className="mt-3.5 text-[13.5px] font-medium text-[#4ECB71]">
-          {block.answer ? `Answered: ${block.answer}` : "Answered"}
-        </div>
-      ) : !canAnswer ? (
-        <div className="mt-3.5 text-[13.5px] font-medium text-[#85858A]">No longer active</div>
-      ) : editing ? (
-        <form
-          className="mt-3.5 flex flex-col gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void submitAnswer(answer);
-          }}
-        >
-          <input
-            aria-label="Answer"
-            value={answer}
-            onChange={(event) => setAnswer(event.target.value)}
-            placeholder="Type your answer"
-            className="rounded-[11px] border border-[#303035] bg-[#0E0E10] px-3.5 py-2.5 text-[14.5px] text-[#ECECEE] outline-none focus:border-[#66666D]"
-          />
-          <div className="flex gap-2">
-            <button
-              type="submit"
-              disabled={!answer.trim() || submitting}
-              className="rounded-[11px] bg-[#F1F1EF] px-[17px] py-2 text-[14.5px] font-medium text-[#17171A] disabled:opacity-50"
-            >
-              {submitting ? "Sending…" : "Send answer"}
-            </button>
-            <button
-              type="button"
-              disabled={submitting}
-              onClick={() => {
-                setAnswer("");
-                setEditing(false);
-              }}
-              className="rounded-[11px] border border-[#26262A] px-[17px] py-2 text-[14.5px] text-[#C9C9CE] disabled:opacity-50"
-            >
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : (
-        <div className="mt-3.5 flex gap-2">
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={() => void submitAnswer("approved")}
-            className="rounded-[11px] bg-[#F1F1EF] px-[17px] py-2 text-[14.5px] font-medium text-[#17171A] disabled:opacity-50"
-          >
-            {submitting ? "Sending…" : "Send it"}
-          </button>
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={() => setEditing(true)}
-            className="rounded-[11px] border border-[#26262A] px-[17px] py-2 text-[14.5px] text-[#C9C9CE] disabled:opacity-50"
-          >
-            Edit first
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function ComputerModePicker({
   value,
   onChange,
@@ -3163,26 +3132,47 @@ function CreateBotForm({
     title: string;
     description: string;
     computerMode: ComputerMode;
-  }) => void;
+  }) => Promise<void>;
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [computerMode, setComputerMode] = useState<ComputerMode>("team");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit() {
+    if (!name.trim() || submitting) return;
+    setError(null);
+    setSubmitting(true);
+    try {
+      await onCreate({ name, title, description, computerMode });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create bot");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <div>
       <div className="mb-4 flex items-center justify-between">
         <span className="text-[13.5px] text-[#85858A]">New bot</span>
-        <button type="button" onClick={onCancel}>
+        <button type="button" aria-label="Cancel new bot" onClick={onCancel}>
           <X size={16} strokeWidth={1.8} />
         </button>
       </div>
+      {error ? (
+        <p role="alert" data-testid="create-bot-error" className="mb-3 text-[13px] text-[#C94244]">
+          {error}
+        </p>
+      ) : null}
       <label className="mt-6 block text-[14px] text-[#85858A]">
         Name
         <input
           value={name}
+          maxLength={BOT_NAME_MAX_LENGTH}
           onChange={(e) => setName(e.target.value)}
           placeholder="Name this bot"
           className="mt-2 w-full rounded-[11px] border border-[#26262A] bg-transparent px-3.5 py-3 text-[#ECECEE]"
@@ -3192,6 +3182,7 @@ function CreateBotForm({
         Title
         <input
           value={title}
+          maxLength={BOT_TITLE_MAX_LENGTH}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Describe what this bot does"
           className="mt-2 w-full rounded-[11px] border border-[#26262A] bg-transparent px-3.5 py-3 text-[#ECECEE]"
@@ -3201,6 +3192,7 @@ function CreateBotForm({
         Description
         <textarea
           value={description}
+          maxLength={BOT_DESCRIPTION_MAX_LENGTH}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="What this bot is for"
           rows={4}
@@ -3210,11 +3202,11 @@ function CreateBotForm({
       <ComputerModePicker value={computerMode} onChange={setComputerMode} />
       <button
         type="button"
-        disabled={!name.trim()}
-        onClick={() => onCreate({ name, title, description, computerMode })}
+        disabled={!name.trim() || submitting}
+        onClick={() => void handleSubmit()}
         className="mt-5 rounded-[11px] bg-[#F1F1EF] px-4 py-2 text-[#17171A] disabled:opacity-40"
       >
-        Create
+        {submitting ? "Creating…" : "Create"}
       </button>
     </div>
   );
@@ -3269,6 +3261,7 @@ function BotSettings({
         Name
         <input
           value={name}
+          maxLength={BOT_NAME_MAX_LENGTH}
           onChange={(e) => setName(e.target.value)}
           className="mt-2 w-full rounded-[11px] border border-[#26262A] bg-transparent px-3.5 py-3 text-[#ECECEE]"
         />
@@ -3277,6 +3270,7 @@ function BotSettings({
         Title
         <input
           value={title}
+          maxLength={BOT_TITLE_MAX_LENGTH}
           onChange={(e) => setTitle(e.target.value)}
           className="mt-2 w-full rounded-[11px] border border-[#26262A] bg-transparent px-3.5 py-3 text-[#ECECEE]"
         />
@@ -3285,6 +3279,7 @@ function BotSettings({
         Description
         <textarea
           value={description}
+          maxLength={BOT_DESCRIPTION_MAX_LENGTH}
           onChange={(e) => setDescription(e.target.value)}
           rows={4}
           className="mt-2 w-full rounded-[11px] border border-[#26262A] bg-transparent px-3.5 py-3 text-[#ECECEE]"
