@@ -180,6 +180,56 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "add_mcp_server",
+    description:
+      "Connect an MCP tool server to this workspace when the user asks you to add one and provides the details (URL or command, optional token/headers/env). The server is created immediately and assigned to you. If it needs browser OAuth authorization, an approval card appears in the chat for the user to complete — tell them to click Authorize. Do not invent endpoints; only use details the user provided.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: 'Display name, e.g. "Brex".' },
+        transport: {
+          type: "string",
+          enum: ["streamable_http", "sse", "stdio"],
+          description:
+            "streamable_http for modern HTTP servers, sse for legacy HTTP servers, stdio for local commands.",
+        },
+        endpoint: {
+          type: "string",
+          description: "HTTPS URL of the remote MCP server (required unless transport is stdio).",
+        },
+        command: {
+          type: "string",
+          description:
+            "Executable path for stdio transport (required for stdio). Must be allowlisted by the deployment.",
+        },
+        args: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Arguments for the stdio command. A single space-separated string also works.",
+        },
+        env: {
+          type: "object",
+          description: 'Environment variables for stdio transport, e.g. {"API_KEY": "..."}.',
+        },
+        headers: {
+          type: "object",
+          description: 'HTTP headers for remote transports, e.g. {"Authorization": "Bearer ..."}.',
+        },
+        secret: {
+          type: "string",
+          description: "Static access token, equivalent to an Authorization: Bearer header.",
+        },
+        assign_to_self: {
+          type: "boolean",
+          description:
+            "Assign the server to you so its tools are usable in this conversation (default true).",
+        },
+      },
+      required: ["name", "transport"],
+    },
+  },
+  {
     name: "remember",
     description: "Store a durable fact in this bot's explicit memory.",
     inputSchema: {
@@ -189,6 +239,58 @@ export const builtinAgentTools: ConnectorTool[] = [
         path: { type: "string" },
       },
       required: ["content"],
+    },
+  },
+  {
+    name: "schedule_create",
+    description:
+      'Create a reminder or recurring job for this bot. Use for "remind me in 10 minutes" or "every morning send a joke". Repeats: cron or every/unit (min 1 minute). One-shot: runAt, delayMinutes, or delaySeconds.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short label shown in Routines." },
+        prompt: {
+          type: "string",
+          description: "What the bot should do when the schedule fires.",
+        },
+        cron: { type: "string", description: "5-field cron for repeating schedules." },
+        every: { type: "number", description: "Repeat interval amount for repeating schedules." },
+        unit: {
+          type: "string",
+          enum: ["minutes", "hours", "days"],
+          description: "Unit for every (minimum 1 minute).",
+        },
+        runAt: {
+          type: "string",
+          description: "ISO datetime for a one-shot schedule.",
+        },
+        delayMinutes: {
+          type: "number",
+          description: "Minutes from now for a one-shot schedule.",
+        },
+        delaySeconds: {
+          type: "number",
+          description: "Seconds from now for a one-shot schedule (may be under one minute).",
+        },
+        timezone: { type: "string", description: "IANA timezone (default UTC)." },
+      },
+      required: ["name", "prompt"],
+    },
+  },
+  {
+    name: "schedule_list",
+    description: "List this bot's active and inactive schedules (routines).",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "schedule_cancel",
+    description: "Cancel a schedule by routineId or exact name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        routineId: { type: "string" },
+        name: { type: "string" },
+      },
     },
   },
   {

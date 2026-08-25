@@ -2,6 +2,7 @@ import { lazy, Suspense, useLayoutEffect } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import { authClient } from "./lib/auth";
 import { markAfterPaint, markOnce } from "./lib/performance";
+import { McpOAuthCallbackPage } from "./pages/McpOAuthCallback";
 import { ShellPage } from "./pages/Shell";
 
 const AuthPage = lazy(() =>
@@ -45,6 +46,10 @@ export function App() {
           path="/onboarding"
           element={user ? <OnboardingPage /> : <Navigate to="/sign-in" replace />}
         />
+        <Route
+          path="/mcp/oauth/callback"
+          element={user ? <McpOAuthCallbackPage /> : <Navigate to="/sign-in" replace />}
+        />
         <Route path="/app" element={user ? <ShellPage /> : <Navigate to="/sign-in" replace />} />
         <Route
           path="/app/g/:groupId"
@@ -62,7 +67,7 @@ export function App() {
 function ShellSkeleton() {
   return (
     <div className="flex h-full overflow-hidden bg-[#050506]">
-      <aside className="hidden w-[316px] shrink-0 border-r border-[#171719] bg-[#0B0B0C] px-3.5 pt-16 md:block">
+      <aside className="hidden w-[316px] shrink-0 border-e border-[#171719] bg-[#0B0B0C] px-3.5 pt-16 md:block">
         <div className="h-10 rounded-xl bg-[#141416]" />
         <div className="mt-5 space-y-2 px-1">
           {[0, 1, 2, 3].map((row) => (
