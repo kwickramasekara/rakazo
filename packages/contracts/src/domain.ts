@@ -512,6 +512,7 @@ export const ComputerStatusSchema = z.object({
   screenHeight: z.number().int().positive(),
   homeRevision: z.string().nullable(),
   busyBotName: z.string().nullable(),
+  updateAvailable: z.boolean(),
 });
 export type ComputerStatus = z.infer<typeof ComputerStatusSchema>;
 
@@ -524,7 +525,7 @@ export const RunSchema = z.object({
   threadId: Id,
   taskId: Id,
   status: RunStatus,
-  trigger: z.enum(["user", "routine", "resume", "follow_up", "spawn", "skill"]),
+  trigger: z.enum(["user", "routine", "resume", "follow_up", "spawn", "skill", "bot_message"]),
   routineId: Id.nullable(),
   modelProvider: z.string().nullable(),
   modelId: z.string().nullable(),

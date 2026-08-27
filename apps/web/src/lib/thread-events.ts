@@ -24,6 +24,7 @@ const runTriggers = new Set<Run["trigger"]>([
   "follow_up",
   "spawn",
   "skill",
+  "bot_message",
 ]);
 
 function runFromStartedEvent(event: ProductEvent, previous: Run | undefined): Run {
@@ -425,6 +426,13 @@ export function computerPanelAutoBoot(
   if (state === "booting" || state === "suspended") return "wait";
   if (state === "running") return screenUrl ? "wait" : "recover-screen";
   return "boot";
+}
+
+/** Auto panel reconnect must use computer.boot — never computer.recover (that destroys the sandbox). */
+export function computerPanelAutoUsesBoot(
+  action: ReturnType<typeof computerPanelAutoBoot>,
+): boolean {
+  return action === "boot" || action === "recover-screen";
 }
 
 export function reduceComputerStatus(
