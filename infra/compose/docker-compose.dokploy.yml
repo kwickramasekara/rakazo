@@ -57,6 +57,7 @@ services:
       RAKAZO_COMPUTER_IMAGE: rakazo/computer:local
       SANDBOX_SCREEN_NETWORK: internal
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - appdata:/data
@@ -86,10 +87,12 @@ services:
       DATA_DIR: /data
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN}
       WAKEUP_DRIVER: graphile
       AGENT_RUNTIME: pi
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      SCREEN_PROXY_SECRET: ${SCREEN_PROXY_SECRET}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL}
       WEB_ORIGIN: ${WEB_ORIGIN}
       API_URL: ${API_URL}
@@ -132,6 +135,7 @@ services:
       DATA_DIR: /data
       SANDBOX_PROVIDER: docker
       SANDBOX_SUPERVISOR_URL: http://supervisor:7091
+      SANDBOX_SUPERVISOR_TOKEN: ${SANDBOX_SUPERVISOR_TOKEN}
       WAKEUP_DRIVER: graphile
       AGENT_RUNTIME: pi
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
@@ -168,6 +172,7 @@ services:
       NODE_ENV: production
       API_PROXY_TARGET: http://api:3100
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      SCREEN_PROXY_SECRET: ${SCREEN_PROXY_SECRET}
       RAKAZO_HOST: ${RAKAZO_HOST:-localhost}
     expose:
       - "5173"
