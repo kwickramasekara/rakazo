@@ -49,6 +49,10 @@ EOF
 chmod +x /tmp/fluxbox-home/.fluxbox/startup
 HOME=/tmp/fluxbox-home /tmp/fluxbox-home/.fluxbox/startup >/tmp/rakazo/fluxbox.log 2>&1 &
 
+rm -f "$AGENT_HOME/.browser-profiles/chromium/SingletonLock" \
+  "$AGENT_HOME/.browser-profiles/chromium/SingletonCookie" \
+  "$AGENT_HOME/.browser-profiles/chromium/SingletonSocket"
+
 HOME="$AGENT_HOME" rakazo-browser >/tmp/rakazo/browser.log 2>&1 &
 browser_up=0
 for _ in $(seq 1 40); do
@@ -77,6 +81,10 @@ if [[ ! -d "$NOVNC_ROOT" ]]; then
 fi
 if [[ ! -f "$NOVNC_ROOT/embed.html" ]]; then
   echo "noVNC embed.html is missing from the computer image" >&2
+  exit 1
+fi
+if [[ ! -f "$NOVNC_ROOT/clipboard-bridge.js" ]]; then
+  echo "noVNC clipboard-bridge.js is missing from the computer image" >&2
   exit 1
 fi
 websockify --heartbeat=30 --web="$NOVNC_ROOT" 0.0.0.0:6080 127.0.0.1:5900 >/tmp/rakazo/novnc.log 2>&1 &

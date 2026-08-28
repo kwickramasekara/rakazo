@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { implement, ORPCError } from "@orpc/server";
 import {
   type AdapterContext,
@@ -27,12 +27,15 @@ import {
   checkpointAndRecordComputerWorkspace,
   computerSupportsUpdate,
   createVoiceProvider,
+  deploymentAutoReviewDefault,
   destroyBot,
   displayBotWorkspacePath,
   type EncryptedSecretStore,
   enqueueTakeoverContinuation,
   expireComputerControl,
   hasActiveComputerControl,
+  isAutoReviewCheckerConfigured,
+  isSandboxGoneError,
   isScratchpadStatus,
   listPiCatalog,
   listScratchpadItems,
@@ -797,6 +800,48 @@ export function createRouter(deps: RouterDeps) {
         );
         return { ok: true as const };
       }),
+      rotateWebhookSecret: authed.bots.rotateWebhookSecret.handler(async ({ context, input }) => {
+        const bot = await repos.getBot(context.actor, input.botId);
+        const plaintext = randomBytes(32).toString("base64url");
+        const stored = await deps.secrets.put(plaintext, {
+          operationId: "bots.rotateWebhookSecret",
+          traceId: "bots.rotateWebhookSecret",
+          workspaceId: context.actor.workspaceId,
+          userId: context.actor.userId,
+          signal: context.signal ?? new AbortController().signal,
+        });
+        await deps.prisma.$transaction(async (tx) => {
+          const previousSecretId = bot.webhookSecretId;
+          await tx.secret.create({
+            data: {
+              id: stored.id,
+              userId: context.actor.userId,
+              workspaceId: context.actor.workspaceId,
+              kind: "webhook",
+              ciphertext: stored.ciphertext,
+            },
+          });
+          await tx.bot.update({
+            where: { id: bot.id },
+            data: { webhookSecretId: stored.id },
+          });
+          if (previousSecretId) {
+            await tx.secret.deleteMany({
+              where: {
+                id: previousSecretId,
+                workspaceId: context.actor.workspaceId,
+                userId: context.actor.userId,
+                kind: "webhook",
+              },
+            });
+          }
+        });
+        return {
+          secret: plaintext,
+          path: `/api/v1/bots/${bot.id}/webhook`,
+          webhookConfigured: true as const,
+        };
+      }),
     },
     groups: {
       create: authed.groups.create.handler(async ({ context, input }) =>
@@ -1523,26 +1568,34 @@ export function createRouter(deps: RouterDeps) {
         ) {
           return { url: null };
         }
-        const session = await deps.sandbox.connectScreen(
-          toComputerRef(bot.computer),
-          {
-            view: "stream",
-            interactive:
-              hasActiveComputerControl(bot.computer) && bot.computer.controlBotId === bot.id,
-            controlToken:
-              bot.computer.controlBotId === bot.id
-                ? (bot.computer.controlLeaseId ?? undefined)
-                : undefined,
-          },
-          await computerScreenContext(
-            deps.prisma,
-            context.actor,
-            bot.computer.id,
-            bot.id,
-            "screen",
-          ),
-        );
-        if (!session.url) return { url: null };
+        const computer = bot.computer;
+        const session = await deps.sandbox
+          .connectScreen(
+            toComputerRef(computer),
+            {
+              view: "stream",
+              interactive: hasActiveComputerControl(computer) && computer.controlBotId === bot.id,
+              controlToken:
+                computer.controlBotId === bot.id
+                  ? (computer.controlLeaseId ?? undefined)
+                  : undefined,
+            },
+            await computerScreenContext(deps.prisma, context.actor, computer.id, bot.id, "screen"),
+          )
+          .catch(async (error: unknown) => {
+            if (!isSandboxGoneError(error)) throw error;
+            // The provider killed this sandbox (idle timeout) while the row still says
+            // running. Clear the dead ref so the UI offers a boot instead of 500ing.
+            // Leave any active control lease alone — expireComputerControl owns that
+            // release (provider screen-control, events, takeover continuation).
+            console.error(`computer ${computer.id} sandbox ${computer.providerRef} is gone`, error);
+            await deps.prisma.computer.updateMany({
+              where: { id: computer.id, providerRef: computer.providerRef },
+              data: { state: "stopped", providerRef: null },
+            });
+            return null;
+          });
+        if (!session?.url) return { url: null };
         scheduleComputerSleep(deps.jobs, bot.computer.id);
         const viewUrl = withViewOnly(
           session.url,
@@ -1685,9 +1738,9 @@ export function createRouter(deps: RouterDeps) {
           });
         }
         const bot = await repos.getBot(context.actor, input.botId);
-        // Validate every recurring cron even when inactive; @once has no next date.
+        // Validate every recurring cron even when inactive; @once and webhook-only have no next date.
         let nextRunAt: Date | null = null;
-        if (!isOneShotRoutineCrons(input.crons)) {
+        if (input.crons.length > 0 && !isOneShotRoutineCrons(input.crons)) {
           const computedNextRunAt = nextRoutineDate(input.crons, input.timezone);
           nextRunAt = input.active ? computedNextRunAt : null;
         }
@@ -1702,6 +1755,7 @@ export function createRouter(deps: RouterDeps) {
             timezone: input.timezone,
             notify: input.notify,
             active: input.active,
+            webhookEnabled: input.webhookEnabled,
             nextRunAt,
           },
         });
@@ -1731,6 +1785,12 @@ export function createRouter(deps: RouterDeps) {
         const active = input.active ?? existing.active;
         const crons = input.crons ?? existing.crons;
         const timezone = input.timezone ?? existing.timezone;
+        const webhookEnabled = input.webhookEnabled ?? existing.webhookEnabled;
+        if (crons.length === 0 && !webhookEnabled) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Add a schedule or webhook trigger",
+          });
+        }
         if (hasMixedOneShotSchedule(crons)) {
           throw new ORPCError("BAD_REQUEST", {
             message: "A one-time schedule can't be combined with other schedules.",
@@ -1754,7 +1814,9 @@ export function createRouter(deps: RouterDeps) {
             JSON.stringify(input.crons) !== JSON.stringify(existing.crons)) ||
           (input.timezone !== undefined && input.timezone !== existing.timezone);
         const recalculatedNextRunAt =
-          !isOneShotRoutineCrons(crons) && (scheduleChanged || (active && !existing.nextRunAt))
+          crons.length > 0 &&
+          !isOneShotRoutineCrons(crons) &&
+          (scheduleChanged || (active && !existing.nextRunAt))
             ? nextRoutineDate(crons, timezone)
             : null;
         let armedOneShotAt: Date | null = null;
@@ -1778,9 +1840,11 @@ export function createRouter(deps: RouterDeps) {
         }
         const nextRunAt = !active
           ? null
-          : isOneShotRoutineCrons(crons)
-            ? (armedOneShotAt ?? existing.nextRunAt)
-            : (recalculatedNextRunAt ?? existing.nextRunAt);
+          : crons.length === 0
+            ? null
+            : isOneShotRoutineCrons(crons)
+              ? (armedOneShotAt ?? existing.nextRunAt)
+              : (recalculatedNextRunAt ?? existing.nextRunAt);
         const row = await deps.prisma.routine.update({
           where: { id: existing.id },
           data: {
@@ -1790,6 +1854,7 @@ export function createRouter(deps: RouterDeps) {
             timezone: input.timezone,
             active: input.active,
             notify: input.notify,
+            webhookEnabled: input.webhookEnabled,
             nextRunAt,
           },
         });
@@ -2784,6 +2849,28 @@ export function createRouter(deps: RouterDeps) {
         return { ok: true as const };
       }),
     },
+    autoReview: {
+      get: authed.autoReview.get.handler(async ({ context }) => {
+        return loadAutoReviewSettings(deps, context.actor);
+      }),
+      set: authed.autoReview.set.handler(async ({ context, input }) => {
+        await deps.prisma.actionAutoReviewPreference.upsert({
+          where: {
+            workspaceId_userId: {
+              workspaceId: context.actor.workspaceId,
+              userId: context.actor.userId,
+            },
+          },
+          create: {
+            workspaceId: context.actor.workspaceId,
+            userId: context.actor.userId,
+            enabled: input.enabled,
+          },
+          update: { enabled: input.enabled },
+        });
+        return loadAutoReviewSettings(deps, context.actor);
+      }),
+    },
     artifacts: {
       list: authed.artifacts.list.handler(async ({ context, input }) => {
         await repos.getBot(context.actor, input.botId);
@@ -3052,6 +3139,30 @@ function mapUpdaterError(error: unknown): never {
   });
 }
 
+async function loadAutoReviewSettings(deps: RouterDeps, actor: Actor) {
+  const [preference, credentials] = await Promise.all([
+    deps.prisma.actionAutoReviewPreference.findUnique({
+      where: {
+        workspaceId_userId: {
+          workspaceId: actor.workspaceId,
+          userId: actor.userId,
+        },
+      },
+      select: { enabled: true },
+    }),
+    deps.prisma.userModelCredential.findMany({
+      where: { userId: actor.userId, workspaceId: actor.workspaceId },
+      select: { provider: true },
+    }),
+  ]);
+  const providers = new Set(credentials.map((row) => row.provider));
+  const enabled = preference?.enabled ?? deploymentAutoReviewDefault(process.env);
+  const checkerAvailable = isAutoReviewCheckerConfigured({
+    hasUserCredentialForProvider: (provider) => providers.has(provider),
+  });
+  return { enabled, checkerAvailable };
+}
+
 async function meDto(deps: RouterDeps, actor: Actor): Promise<Me> {
   const [user, cred, settings] = await Promise.all([
     deps.prisma.user.findUniqueOrThrow({ where: { id: actor.userId } }),
@@ -3072,6 +3183,7 @@ async function meDto(deps: RouterDeps, actor: Actor): Promise<Me> {
     defaultModel: cred?.defaultModel ?? settings?.defaultModelId ?? deps.env.defaultModel,
     computerHost: computerHostFor(settings?.computerHost, deps.env.sandboxProvider),
     canChooseHostComputer: actor.isDeploymentOwner && deps.env.sandboxProvider === "docker",
+    sandboxProvider: deps.env.sandboxProvider,
     avatarStyle: user.avatarStyle === "organic" ? "organic" : "robot",
   };
 }
@@ -3182,6 +3294,7 @@ async function deploymentDto(prisma: PrismaClient, sandboxProvider: string) {
     defaultModel: settings?.defaultModelId ?? null,
     computerHost: computerHostFor(settings?.computerHost, sandboxProvider),
     canChooseHostComputer: sandboxProvider === "docker",
+    sandboxProvider,
   };
 }
 
@@ -3414,6 +3527,7 @@ function mapRoutine(row: {
   timezone: string;
   active: boolean;
   notify: boolean;
+  webhookEnabled: boolean;
   lastRunAt: Date | null;
   nextRunAt: Date | null;
   createdAt: Date;
@@ -3427,6 +3541,7 @@ function mapRoutine(row: {
     timezone: row.timezone,
     active: row.active,
     notify: row.notify,
+    webhookEnabled: row.webhookEnabled,
     lastRunAt: row.lastRunAt?.toISOString() ?? null,
     nextRunAt: row.nextRunAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),

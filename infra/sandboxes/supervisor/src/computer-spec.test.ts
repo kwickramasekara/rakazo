@@ -119,6 +119,7 @@ describe("graphical computer spec", () => {
     expect(dockerfile).toMatch(/USER 1000:1000/);
     expect(start).toMatch(/rakazo-computer-control/);
     expect(start).toMatch(/rakazo-browser/);
+    expect(start).toMatch(/SingletonLock/);
     expect(start).toMatch(/x11vnc .* -viewonly /);
     expect(browser).toMatch(/\.browser-profiles\/chromium/);
     expect(start).not.toMatch(/windowsize 1280 800/);
@@ -131,6 +132,13 @@ describe("graphical computer spec", () => {
 
   it("points the screen at the chrome-less noVNC embed", () => {
     expect(screenUrlFor("16080")).toBe("http://127.0.0.1:16080/embed.html");
+  });
+
+  it("wires host clipboard paste into the chrome-less embed", () => {
+    const root = path.resolve(import.meta.dirname, "../../computer");
+    const embed = readFileSync(path.join(root, "embed.html"), "utf8");
+    expect(embed).toMatch(/clipboard-bridge\.js/);
+    expect(embed).toMatch(/attachHostClipboardPaste/);
   });
 
   it("uses the published host mapping in the default topology even when a container IP exists", () => {

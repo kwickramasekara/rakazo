@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { McpConnector } from "./mcp-connector.js";
+import { allowlistDrift, McpConnector } from "./mcp-connector.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -89,7 +89,7 @@ describe("MCP connector session cache", () => {
     await connector.close();
   });
 
-  it("does not send stored credentials to a localhost HTTP server", async () => {
+  it("sends stored credentials to an explicitly configured localhost HTTP server", async () => {
     const state = { failNext: false, initializations: 0, headers: [] as Record<string, string>[] };
     const localAssignment = {
       ...ASSIGNMENT,
@@ -118,8 +118,8 @@ describe("MCP connector session cache", () => {
       signal: new AbortController().signal,
     } as never);
 
-    expect(state.headers[0]?.authorization).toBeUndefined();
-    expect(state.headers[0]?.["x-api-key"]).toBeUndefined();
+    expect(state.headers[0]?.authorization).toBe("Bearer local-token");
+    expect(state.headers[0]?.["x-api-key"]).toBe("local-key");
     await connector.close();
   });
 
@@ -195,5 +195,29 @@ describe("MCP connector session cache", () => {
     expect(state.initializations).toBe(3);
 
     await connector.close();
+  });
+});
+
+describe("allowlistDrift", () => {
+  it("names the allowed tools the server no longer offers", () => {
+    const offered = [{ name: "echo" }, { name: "upper" }];
+    expect(allowlistDrift(["echo", "vanished_tool"], offered)).toEqual({
+      missing: ["vanished_tool"],
+      offered: 2,
+      stringAllowedCount: 2,
+    });
+    expect(allowlistDrift(["echo"], offered).missing).toEqual([]);
+    // allowedTools is a Json column, so it can hold anything: it must not throw.
+    expect(allowlistDrift(null, offered)).toEqual({
+      missing: [],
+      offered: 2,
+      stringAllowedCount: 0,
+    });
+    // Non-string JSON values are ignored for both missing and the warning ratio.
+    expect(allowlistDrift([42, "vanished_tool"], offered)).toEqual({
+      missing: ["vanished_tool"],
+      offered: 2,
+      stringAllowedCount: 1,
+    });
   });
 });

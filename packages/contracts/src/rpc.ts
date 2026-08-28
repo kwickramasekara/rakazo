@@ -3,6 +3,7 @@ import * as z from "zod";
 import { ATTACHMENT_MAX_BASE64_LENGTH, ATTACHMENT_MAX_COUNT } from "./attachments.js";
 import {
   ActionApprovalRuleSchema,
+  ActionAutoReviewSettingsSchema,
   AgentSkillCatalogEntrySchema,
   AgentSkillSchema,
   AppBootstrapSchema,
@@ -197,6 +198,13 @@ export const appContract = {
     remove: oc
       .input(z.object({ botId: Id, deleteMemories: z.boolean().default(false) }))
       .output(z.object({ ok: z.literal(true) })),
+    rotateWebhookSecret: oc.input(botId).output(
+      z.object({
+        secret: z.string(),
+        path: z.string(),
+        webhookConfigured: z.literal(true),
+      }),
+    ),
   },
   groups: {
     create: oc.input(CreateGroupInput).output(GroupSchema),
@@ -323,17 +331,28 @@ export const appContract = {
     create: oc.input(CreateRoutineInput).output(RoutineSchema),
     update: oc
       .input(
-        z.object({
-          routineId: Id,
-          name: z.string().optional(),
-          prompt: z.string().optional(),
-          crons: z.array(z.string().min(1)).min(1).optional(),
-          timezone: z.string().optional(),
-          active: z.boolean().optional(),
-          notify: z.boolean().optional(),
-          /** ISO datetime to arm a never-run one-shot. */
-          runAt: IsoDate.optional(),
-        }),
+        z
+          .object({
+            routineId: Id,
+            name: z.string().optional(),
+            prompt: z.string().optional(),
+            crons: z.array(z.string().min(1)).optional(),
+            timezone: z.string().optional(),
+            active: z.boolean().optional(),
+            notify: z.boolean().optional(),
+            webhookEnabled: z.boolean().optional(),
+            /** ISO datetime to arm a never-run one-shot. */
+            runAt: IsoDate.optional(),
+          })
+          .superRefine((value, ctx) => {
+            if (value.crons && value.crons.length === 0 && value.webhookEnabled === false) {
+              ctx.addIssue({
+                code: "custom",
+                message: "Add a schedule or webhook trigger",
+                path: ["crons"],
+              });
+            }
+          }),
       )
       .output(RoutineSchema),
     remove: oc.input(z.object({ routineId: Id })).output(z.object({ ok: z.literal(true) })),
@@ -522,6 +541,10 @@ export const appContract = {
       )
       .output(ActionApprovalRuleSchema),
     remove: oc.input(z.object({ id: Id })).output(z.object({ ok: z.literal(true) })),
+  },
+  autoReview: {
+    get: oc.output(ActionAutoReviewSettingsSchema),
+    set: oc.input(z.object({ enabled: z.boolean() })).output(ActionAutoReviewSettingsSchema),
   },
   artifacts: {
     list: oc.input(botId).output(z.array(ArtifactSchema)),
