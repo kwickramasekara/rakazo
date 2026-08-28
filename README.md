@@ -20,7 +20,7 @@ Rakazo is in beta. Learn more at [rakazo.com](https://rakazo.com).
 - Bots that can delegate to peer bots or short-lived subagents
 - Bring-your-own model credentials through Pi
 - App integrations through Composio or Pipedream Connect, plus user-installed Treg, remote MCP, and OpenAPI tool sources
-- Docker, E2B, Daytona, and trusted local-computer support
+- Docker, E2B, Daytona, Box, and trusted local-computer support
 
 ## Demo
 
@@ -36,7 +36,7 @@ https://github.com/user-attachments/assets/dccdeddb-2134-4a56-8eed-b2e591736b1c
 - Better Auth
 - Graphile Worker
 - Pi
-- Docker, E2B, and Daytona
+- Docker, E2B, Daytona, and Box
 - Composio, Pipedream Connect, MCP, and OpenAPI integrations
 
 ## Quick start
@@ -49,7 +49,8 @@ cd rakazo
 cp .env.example .env
 ```
 
-Set `BETTER_AUTH_SECRET` and `ENCRYPTION_KEY` in `.env` to independent, long random values. You can
+Set `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY`, and `SCREEN_PROXY_SECRET` in `.env` to independent
+long random values. Docker sandboxes also need a dedicated `SANDBOX_SUPERVISOR_TOKEN`. You can
 also set `OPENROUTER_API_KEY`, or connect a supported model provider during onboarding.
 
 Managed app catalogs are optional. Set `COMPOSIO_API_KEY` for Composio, or the
