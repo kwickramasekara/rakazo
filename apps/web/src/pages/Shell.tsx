@@ -87,6 +87,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  type DragEvent,
   lazy,
   type MutableRefObject,
   memo,
@@ -120,11 +121,16 @@ import { readActivityMode, writeActivityMode } from "../lib/activity-mode";
 import { type ArtifactTarget, decodeArtifactBase64 } from "../lib/artifact-open";
 import { authClient } from "../lib/auth";
 import { takeInitialBootstrap } from "../lib/bootstrap";
+import {
+  deliverBrowserRunNotification,
+  requestBrowserNotificationPermission,
+  shouldNotifyBrowser,
+} from "../lib/browser-notifications";
 import { chartViewport } from "../lib/chart-viewport";
 import { dictation } from "../lib/dictation";
 import { localTimezone } from "../lib/local-timezone";
 import { connectMcpOauth } from "../lib/mcp-connect";
-import { revokePendingAttachmentPreviews } from "../lib/pending-attachments";
+import { isFileDrag, revokePendingAttachmentPreviews } from "../lib/pending-attachments";
 import { markAfterPaint, markOnce } from "../lib/performance";
 import { rpc } from "../lib/rpc";
 import {
@@ -213,7 +219,18 @@ type PendingAttachment = {
   previewUrl?: string;
 };
 
+type PendingBrowserNotification = {
+  event: Pick<ProductEvent, "type" | "runId" | "botId">;
+  botId: string;
+  botName: string;
+};
+
 const ATTACHMENT_ACCEPT = ATTACHMENT_ALLOWED_MIME_TYPES.join(",");
+const THREAD_SNAPSHOT_TIMEOUT_MS = 2_000;
+
+function threadSnapshotSignal(parent: AbortSignal): AbortSignal {
+  return AbortSignal.any([parent, AbortSignal.timeout(THREAD_SNAPSHOT_TIMEOUT_MS)]);
+}
 
 function collapsedSidebarSectionsStorageKey(userId: string | null | undefined): string | null {
   if (!userId) return null;
@@ -248,6 +265,8 @@ export function ShellPage() {
   const userId = session.data?.user.id;
   const [groups, setGroups] = useState<Group[]>([]);
   const [bots, setBots] = useState<Bot[]>([]);
+  const botsRef = useRef(bots);
+  botsRef.current = bots;
   const [botSections, setBotSections] = useState<BotSection[]>([]);
   const [archivedBots, setArchivedBots] = useState<Bot[]>([]);
   const [archivedGroups, setArchivedGroups] = useState<Group[]>([]);
@@ -415,6 +434,8 @@ export function ShellPage() {
   } | null>(null);
   const manuallyUnread = useRef(new Set<string>());
   const readVisibleGroups = useRef(new Set<string>());
+  const notifiedBrowserRuns = useRef(new Set<string>());
+  const pendingBrowserNotifications = useRef(new Map<string, PendingBrowserNotification>());
   const computerVisible = useRef(false);
   computerVisible.current = panel === "computer" || computerOpen;
   const autoSpoken = useRef<string | null>(null);
@@ -485,6 +506,67 @@ export function ShellPage() {
       }
     },
     [markBotRead],
+  );
+  const deliverBrowserNotification = useCallback((pending: PendingBrowserNotification): boolean => {
+    const runId = pending.event.runId;
+    if (typeof runId !== "string") return true;
+    const currentBot = botsRef.current.find((bot) => bot.id === pending.botId);
+    if (!currentBot || typeof Notification === "undefined") return true;
+    const result = deliverBrowserRunNotification(
+      pending.event,
+      currentBot.name || pending.botName,
+      {
+        enabled: currentBot.notifyOnFinish,
+        pageVisible: document.visibilityState === "visible",
+        windowFocused: document.hasFocus(),
+        permission: Notification.permission,
+        notifiedRunIds: notifiedBrowserRuns.current,
+        show: (title, body) => new Notification(title, { body }),
+      },
+    );
+    return result !== "pending";
+  }, []);
+  const flushPendingBrowserNotifications = useCallback(() => {
+    for (const [runId, pending] of pendingBrowserNotifications.current) {
+      if (deliverBrowserNotification(pending)) {
+        pendingBrowserNotifications.current.delete(runId);
+      }
+    }
+  }, [deliverBrowserNotification]);
+  const notifyBrowserForTerminalEvent = useCallback(
+    (
+      event: Pick<ProductEvent, "type" | "threadId" | "runId" | "seq" | "botId">,
+      subscribedThreadId: string | undefined,
+      initialCursor: number,
+      streamReady: boolean,
+      botName: string,
+    ) => {
+      const runId = event.runId;
+      const botId = event.botId;
+      if (typeof runId !== "string" || typeof botId !== "string") return;
+      const eligible = shouldNotifyBrowser(event, {
+        subscribedThreadId: subscribedThreadId ?? "",
+        initialCursor,
+        streamReady,
+        pageVisible: document.visibilityState === "visible",
+        windowFocused: document.hasFocus(),
+        permission: "granted",
+        notifiedRunIds: notifiedBrowserRuns.current,
+      });
+      if (!eligible || !botsRef.current.find((bot) => bot.id === botId)?.notifyOnFinish) return;
+      const pending = { event, botId, botName } satisfies PendingBrowserNotification;
+      if (typeof Notification === "undefined" || Notification.permission === "denied") return;
+      if (Notification.permission === "default") {
+        pendingBrowserNotifications.current.set(runId, pending);
+        return;
+      }
+      if (deliverBrowserNotification(pending)) {
+        pendingBrowserNotifications.current.delete(runId);
+      } else {
+        pendingBrowserNotifications.current.set(runId, pending);
+      }
+    },
+    [deliverBrowserNotification],
   );
 
   const refreshBots = useCallback(
@@ -557,12 +639,12 @@ export function ShellPage() {
     });
   }
 
-  async function refreshGroupThread(id: string) {
+  async function refreshGroupThread(id: string, signal?: AbortSignal) {
     const scrollElement = messageScroll.current;
     const stickToEnd = !scrollElement || transcriptIsNearEnd(scrollElement);
     markOnce("rk:renderer:thread-request-start");
     const request = ++groupRefreshEpoch.current;
-    const snap = await rpc.threads.get({ groupId: id });
+    const snap = await rpc.threads.get({ groupId: id }, signal ? { signal } : undefined);
     markOnce("rk:renderer:thread-response");
     if (activeGroupId.current !== id || request !== groupRefreshEpoch.current) return snap;
     const reconciled = reconcileRefreshedThread(
@@ -586,7 +668,7 @@ export function ShellPage() {
     return snap;
   }
 
-  async function refreshThread(id: string) {
+  async function refreshThread(id: string, signal?: AbortSignal) {
     const scrollElement = messageScroll.current;
     const stickToEnd = !scrollElement || transcriptIsNearEnd(scrollElement);
     markOnce("rk:renderer:thread-request-start");
@@ -594,7 +676,7 @@ export function ShellPage() {
     const request = ++threadRefreshEpoch.current;
     // Apply threads.get as soon as it returns so stop/takeover status is not held behind
     // routines/skills/screen fetches (progress can advance the cursor meanwhile).
-    const snap = await rpc.threads.get({ botId: id });
+    const snap = await rpc.threads.get({ botId: id }, signal ? { signal } : undefined);
     markOnce("rk:renderer:thread-response");
     if (
       activeBotId.current !== id ||
@@ -619,22 +701,27 @@ export function ShellPage() {
     ) {
       snapTranscriptToEndAfterFrame();
     }
-    const [routines, skills] = await Promise.all([
-      rpc.routines.list({ botId: id }),
-      rpc.skills.list({ botId: id }),
-      refreshComputerScreen(id),
-    ]);
-    if (
-      activeBotId.current !== id ||
-      epoch !== historyEpoch.current ||
-      request !== threadRefreshEpoch.current
-    ) {
-      return snap;
-    }
-    setRoutines(routines);
-    setRoutinesBotId(id);
-    setTaughtSkills(skills);
-    setTaughtSkillsBotId(id);
+    void Promise.all([
+      rpc.routines.list({ botId: id }).catch(() => null),
+      rpc.skills.list({ botId: id }).catch(() => null),
+      refreshComputerScreen(id).catch(() => null),
+    ]).then(([routines, skills]) => {
+      if (
+        activeBotId.current !== id ||
+        epoch !== historyEpoch.current ||
+        request !== threadRefreshEpoch.current
+      ) {
+        return;
+      }
+      if (routines) {
+        setRoutines(routines);
+        setRoutinesBotId(id);
+      }
+      if (skills) {
+        setTaughtSkills(skills);
+        setTaughtSkillsBotId(id);
+      }
+    });
     return snap;
   }
 
@@ -895,10 +982,61 @@ export function ShellPage() {
         primed?.botId === active.id
           ? primed
           : pendingJump
-            ? await rpc.threads.get({ botId: active.id }).catch(() => null)
-            : await refreshThread(active.id).catch(() => null);
+            ? await rpc.threads
+                .get({ botId: active.id }, { signal: threadSnapshotSignal(abort.signal) })
+                .catch(() => null)
+            : await refreshThread(active.id, threadSnapshotSignal(abort.signal)).catch(() => null);
       if (abort.signal.aborted) return;
-      let cursor = snap?.cursor ?? -1;
+      let subscribedThreadId = snap?.threadId;
+      let initialCursor = snap?.cursor ?? -1;
+      let headRetryMs = 250;
+      while (!subscribedThreadId && !abort.signal.aborted) {
+        const head = await rpc.threads
+          .head({ botId: active.id }, { signal: threadSnapshotSignal(abort.signal) })
+          .catch(() => null);
+        if (head) {
+          subscribedThreadId = head.threadId;
+          initialCursor = head.cursor;
+          break;
+        }
+        try {
+          await abortableDelay(headRetryMs, abort.signal);
+        } catch {
+          return;
+        }
+        headRetryMs = Math.min(headRetryMs * 2, 5_000);
+      }
+      if (!subscribedThreadId || abort.signal.aborted) return;
+      let cursor = initialCursor;
+      let snapshotReady = snapshotRef.current?.threadId === subscribedThreadId;
+      const pendingSnapshotEvents: ProductEvent[] = [];
+      if (!snapshotReady) {
+        void (async () => {
+          let snapshotRetryMs = 250;
+          while (!snapshotReady && !abort.signal.aborted) {
+            try {
+              await abortableDelay(snapshotRetryMs, abort.signal);
+            } catch {
+              return;
+            }
+            await refreshThread(active.id, threadSnapshotSignal(abort.signal)).catch(() => null);
+            if (abort.signal.aborted) return;
+            const committed = snapshotRef.current;
+            if (committed?.threadId === subscribedThreadId) {
+              snapshotReady = true;
+              const pending = pendingSnapshotEvents.splice(0);
+              for (const event of pending) {
+                if (event.seq > committed.cursor) {
+                  applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+                }
+              }
+              return;
+            }
+            snapshotRetryMs = Math.min(snapshotRetryMs * 2, 5_000);
+          }
+        })();
+      }
+      const streamReady = true;
       let retryMs = 250;
       while (!abort.signal.aborted) {
         try {
@@ -910,7 +1048,19 @@ export function ShellPage() {
             if (abort.signal.aborted) break;
             cursor = Math.max(cursor, event.seq);
             retryMs = 250;
-            applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+            if (snapshotReady && snapshotRef.current?.threadId === event.threadId) {
+              applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+            } else {
+              pendingSnapshotEvents.push(event);
+            }
+            const currentBot = botsRef.current.find((bot) => bot.id === active.id);
+            notifyBrowserForTerminalEvent(
+              event,
+              subscribedThreadId,
+              initialCursor,
+              streamReady,
+              currentBot?.name ?? active.name,
+            );
             if (event.type === "thread.cleared") {
               expandedHistoryThread.current = null;
               pinnedAroundRef.current = null;
@@ -949,7 +1099,7 @@ export function ShellPage() {
           // The durable cursor below makes reconnects safe after a transient network failure.
         }
         if (abort.signal.aborted) break;
-        await refreshThread(active.id).catch(() => null);
+        await refreshThread(active.id, threadSnapshotSignal(abort.signal)).catch(() => null);
         await abortableDelay(retryMs, abort.signal);
         retryMs = Math.min(retryMs * 2, 5_000);
       }
@@ -957,7 +1107,7 @@ export function ShellPage() {
     return () => {
       abort.abort();
     };
-  }, [active?.id, markBotReadIfVisible]);
+  }, [active?.id, markBotReadIfVisible, notifyBrowserForTerminalEvent]);
 
   useEffect(() => {
     if (!groupId || !activeGroup) return;
@@ -998,10 +1148,61 @@ export function ShellPage() {
     const abort = new AbortController();
     void (async () => {
       const snap = pendingJump
-        ? await rpc.threads.get({ groupId }).catch(() => null)
-        : await refreshGroupThread(groupId).catch(() => null);
+        ? await rpc.threads
+            .get({ groupId }, { signal: threadSnapshotSignal(abort.signal) })
+            .catch(() => null)
+        : await refreshGroupThread(groupId, threadSnapshotSignal(abort.signal)).catch(() => null);
       if (abort.signal.aborted) return;
-      let cursor = snap?.cursor ?? -1;
+      let subscribedThreadId = snap?.threadId;
+      let initialCursor = snap?.cursor ?? -1;
+      let headRetryMs = 250;
+      while (!subscribedThreadId && !abort.signal.aborted) {
+        const head = await rpc.threads
+          .head({ groupId }, { signal: threadSnapshotSignal(abort.signal) })
+          .catch(() => null);
+        if (head) {
+          subscribedThreadId = head.threadId;
+          initialCursor = head.cursor;
+          break;
+        }
+        try {
+          await abortableDelay(headRetryMs, abort.signal);
+        } catch {
+          return;
+        }
+        headRetryMs = Math.min(headRetryMs * 2, 5_000);
+      }
+      if (!subscribedThreadId || abort.signal.aborted) return;
+      let cursor = initialCursor;
+      let snapshotReady = snapshotRef.current?.threadId === subscribedThreadId;
+      const pendingSnapshotEvents: ProductEvent[] = [];
+      if (!snapshotReady) {
+        void (async () => {
+          let snapshotRetryMs = 250;
+          while (!snapshotReady && !abort.signal.aborted) {
+            try {
+              await abortableDelay(snapshotRetryMs, abort.signal);
+            } catch {
+              return;
+            }
+            await refreshGroupThread(groupId, threadSnapshotSignal(abort.signal)).catch(() => null);
+            if (abort.signal.aborted) return;
+            const committed = snapshotRef.current;
+            if (committed?.threadId === subscribedThreadId) {
+              snapshotReady = true;
+              const pending = pendingSnapshotEvents.splice(0);
+              for (const event of pending) {
+                if (event.seq > committed.cursor) {
+                  applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+                }
+              }
+              return;
+            }
+            snapshotRetryMs = Math.min(snapshotRetryMs * 2, 5_000);
+          }
+        })();
+      }
+      const streamReady = true;
       let retryMs = 250;
       while (!abort.signal.aborted) {
         try {
@@ -1010,7 +1211,19 @@ export function ShellPage() {
             if (abort.signal.aborted) break;
             cursor = Math.max(cursor, event.seq);
             retryMs = 250;
-            applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+            if (snapshotReady && snapshotRef.current?.threadId === event.threadId) {
+              applyThreadEvent(event, commitSnapshot, commitComputer, snapshotRef, computerRef);
+            } else {
+              pendingSnapshotEvents.push(event);
+            }
+            const eventBot = botsRef.current.find((bot) => bot.id === event.botId);
+            notifyBrowserForTerminalEvent(
+              event,
+              subscribedThreadId,
+              initialCursor,
+              streamReady,
+              eventBot?.name ?? activeGroup.name,
+            );
             if (event.type === "thread.message.created" && event.payload.role === "bot") {
               readVisibleGroups.current.delete(groupId);
               markVisibleGroupRead();
@@ -1027,7 +1240,7 @@ export function ShellPage() {
           // reconnect safely
         }
         if (abort.signal.aborted) break;
-        await refreshGroupThread(groupId).catch(() => null);
+        await refreshGroupThread(groupId, threadSnapshotSignal(abort.signal)).catch(() => null);
         await abortableDelay(retryMs, abort.signal);
         retryMs = Math.min(retryMs * 2, 5_000);
       }
@@ -1037,7 +1250,7 @@ export function ShellPage() {
       document.removeEventListener("visibilitychange", markVisibleGroupRead);
       abort.abort();
     };
-  }, [activeGroup?.id, groupId]);
+  }, [activeGroup?.id, groupId, notifyBrowserForTerminalEvent]);
 
   const filtered = useMemo(
     () =>
@@ -1491,6 +1704,13 @@ export function ShellPage() {
       );
       const groupTarget = plan.rerouteGroupId ?? initialGroupTarget;
       const botTarget = reroutedToGroup ? undefined : initialBotTarget;
+      if (
+        plan.shouldSend &&
+        (groupTarget || botsRef.current.find((bot) => bot.id === botTarget)?.notifyOnFinish)
+      ) {
+        const permissionRequest = requestBrowserNotificationPermission();
+        if (permissionRequest) void permissionRequest.then(flushPendingBrowserNotifications);
+      }
       const trimmed = plan.trimmed;
       setSending(true);
       setSendError(null);
@@ -1582,7 +1802,14 @@ export function ShellPage() {
         setSending(false);
       }
     },
-    [activeReplyTarget?.id, navigate, pendingAttachments, sending, t],
+    [
+      activeReplyTarget?.id,
+      flushPendingBrowserNotifications,
+      navigate,
+      pendingAttachments,
+      sending,
+      t,
+    ],
   );
   const followUpMessage = useCallback(async (text: string) => {
     const id = activeBotId.current;
@@ -3590,6 +3817,8 @@ const Composer = memo(function Composer({
   const [selectedSkill, setSelectedSkill] = useState<AgentSkillCatalogEntry | null>(null);
   const [selectedMentions, setSelectedMentions] = useState<ComposerMention[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dragDepth = useRef(0);
+  const [draggingFiles, setDraggingFiles] = useState(false);
   const canSend =
     draft.trim().length > 0 ||
     selectedSkill !== null ||
@@ -3708,12 +3937,68 @@ const Composer = memo(function Composer({
     void onSend(text, mentions);
   }
 
+  function handleDragEnter(event: DragEvent<HTMLFieldSetElement>) {
+    const dataTransfer = event.dataTransfer;
+    if (!isFileDrag(dataTransfer)) return;
+    event.preventDefault();
+    if (disabled) {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return;
+    }
+    dragDepth.current += 1;
+    setDraggingFiles(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLFieldSetElement>) {
+    const dataTransfer = event.dataTransfer;
+    if (!isFileDrag(dataTransfer)) return;
+    event.preventDefault();
+    dataTransfer.dropEffect = disabled ? "none" : "copy";
+    if (disabled) {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return;
+    }
+    setDraggingFiles(true);
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLFieldSetElement>) {
+    if (!isFileDrag(event.dataTransfer)) return;
+    if (disabled) {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return;
+    }
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDraggingFiles(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLFieldSetElement>) {
+    const dataTransfer = event.dataTransfer;
+    if (!isFileDrag(dataTransfer)) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDraggingFiles(false);
+    if (!disabled) void onAttachmentPick(dataTransfer.files);
+  }
+
   const showComposerPlaceholder =
     draft.length === 0 && selectedSkill === null && selectedMentions.length === 0;
   const replyName = replyTarget ? (replyTargetName ?? previewMessageText(replyTarget)) : "";
 
   return (
-    <div className="relative z-30 px-3 pb-4 pt-3 md:px-6 md:pb-6">
+    <fieldset
+      aria-label={t`Message composer`}
+      data-dragging={draggingFiles ? "files" : undefined}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className={`relative z-30 m-0 min-w-0 border-0 px-3 pb-4 pt-3 md:px-6 md:pb-6 ${
+        draggingFiles ? "rounded-[14px] ring-2 ring-inset ring-[#8B5CF6]" : ""
+      }`}
+    >
       {sendError || dictationError || runError ? (
         <div
           role="alert"
@@ -3999,7 +4284,7 @@ const Composer = memo(function Composer({
           </button>
         )}
       </div>
-    </div>
+    </fieldset>
   );
 });
 
@@ -4546,7 +4831,7 @@ const MessageView = memo(function MessageView({
           return (
             <div key={i} className="flex justify-end">
               <div
-                className="max-w-[70%] rounded-[20px] bg-[#F1F1EF] px-[18px] py-3 text-[15.5px] leading-[1.45] text-[#1A1A1A]"
+                className="max-w-[70%] whitespace-pre-wrap rounded-[20px] bg-[#F1F1EF] px-[18px] py-3 text-[15.5px] leading-[1.45] text-[#1A1A1A]"
                 dir="auto"
               >
                 {block.text}
