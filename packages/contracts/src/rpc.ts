@@ -37,6 +37,10 @@ import {
   ModelConnectInputSchema,
   ModelCredentialSchema,
   ModelOAuthBeginSchema,
+  PhoneAgentConnectionSchema,
+  PhoneChannelMembershipSchema,
+  PhoneStatusSchema,
+  ReorderBotsInput,
   RoutineSchema,
   ScratchpadItemSchema,
   ScratchpadItemStatusSchema,
@@ -191,6 +195,7 @@ export const appContract = {
     get: oc.input(botId).output(BotSchema),
     create: oc.input(CreateBotInput).output(BotSchema),
     duplicate: oc.input(botId).output(BotSchema),
+    reorder: oc.input(ReorderBotsInput).output(z.object({ ok: z.literal(true) })),
     update: oc.input(UpdateBotInput).output(BotSchema),
     setComputer: oc.input(z.object({ botId: Id, mode: ComputerModeSchema })).output(BotSchema),
     archive: oc.input(botId).output(z.object({ ok: z.literal(true) })),
@@ -535,6 +540,24 @@ export const appContract = {
       .output(ConnectionSchema),
     revoke: oc.input(z.object({ connectionId: Id })).output(z.object({ ok: z.literal(true) })),
   },
+  /** Phone messaging surface: link state, iMessage channels, agent connections. */
+  phone: {
+    status: oc.output(PhoneStatusSchema),
+    channels: {
+      list: oc.output(z.array(PhoneChannelMembershipSchema)),
+      respond: oc
+        .input(z.object({ channelId: Id, accept: z.boolean() }))
+        .output(PhoneChannelMembershipSchema),
+      leave: oc.input(z.object({ channelId: Id })).output(z.object({ ok: z.literal(true) })),
+    },
+    connections: {
+      list: oc.output(z.array(PhoneAgentConnectionSchema)),
+      respond: oc
+        .input(z.object({ connectionId: Id, accept: z.boolean() }))
+        .output(PhoneAgentConnectionSchema),
+      revoke: oc.input(z.object({ connectionId: Id })).output(z.object({ ok: z.literal(true) })),
+    },
+  },
   approvalRules: {
     list: oc.output(z.array(ActionApprovalRuleSchema)),
     set: oc
@@ -584,6 +607,7 @@ export const appContract = {
     registerPush: oc
       .input(z.object({ token: z.string().min(8).max(512) }))
       .output(z.object({ ok: z.literal(true) })),
+    unregisterPush: oc.output(z.object({ ok: z.literal(true) })),
   },
   search: {
     query: oc.input(z.object({ q: z.string().max(200) })).output(SearchQueryOutputSchema),
