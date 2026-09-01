@@ -141,6 +141,25 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "ask_user",
+    description:
+      "Ask the user one short multiple-choice question with tappable options, then wait for their selection. Use this instead of asking them to type when two to four concise choices are enough.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        question: { type: "string", maxLength: 240 },
+        options: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: 80 },
+          minItems: 2,
+          maxItems: 4,
+          uniqueItems: true,
+        },
+      },
+      required: ["question", "options"],
+    },
+  },
+  {
     name: "request_secret",
     description:
       "Collect a one-shot OTP, password, or API key in a masked field that never reaches the chat transcript or model. For website logins, CAPTCHA, passkeys, or anything that needs the live desktop, call request_takeover instead.",
@@ -197,7 +216,7 @@ export const builtinAgentTools: ConnectorTool[] = [
   {
     name: "add_mcp_server",
     description:
-      "Connect an MCP tool server to this workspace when the user asks you to add one and provides the details (URL or command, optional token/headers/env). The server is created immediately and assigned to you. If it needs browser OAuth authorization, an approval card appears in the chat for the user to complete — tell them to click Authorize. Do not invent endpoints; only use details the user provided.",
+      "Connect an MCP tool server to this Space when the user asks you to add one and provides the details (URL or command, optional token/headers/env). The server is created immediately and assigned to you. If it needs browser OAuth authorization, an approval card appears in the chat for the user to complete — tell them to click Authorize. Do not invent endpoints; only use details the user provided.",
     inputSchema: {
       type: "object",
       properties: {
@@ -291,7 +310,7 @@ export const builtinAgentTools: ConnectorTool[] = [
     readOnly: true,
   },
   // Semantic-memory tools: exposed by selectMemoryTools() only when a
-  // workspace memory provider is configured (which hides `remember`).
+  // A Space memory provider is configured (which hides `remember`).
   {
     name: "save_memory",
     description:
@@ -520,6 +539,23 @@ export const builtinAgentTools: ConnectorTool[] = [
     },
   },
   {
+    name: "create_space",
+    description:
+      "Propose a new space in the current organization when the user asks for a separate data boundary. A space can contain many bots and groups, but its chats, files, memory, tools, and integrations stay isolated from other spaces. This always shows the user a confirmation card before creation. Creating the space is the whole action; do not create bots in it unless the user asks later.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          minLength: 1,
+          maxLength: 60,
+          description: 'Short display name, e.g. "Customer support".',
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "spawn_bot",
     description:
       "Create a full, regular bot — the same kind the user creates from the + button. It gets its own thread, computer, and memory, and appears as a peer in the bot list. Do not also call run_subagent. Creating the bot is the whole action. Only set prompt if the user asked that new bot to start work immediately.",
@@ -595,21 +631,22 @@ export const builtinAgentTools: ConnectorTool[] = [
   },
 ];
 
-/** Agent-connection tools, exposed only when the phone surface is enabled. */
+/** Agent-connection tools, exposed only when the messaging surface is enabled. */
 export const agentConnectionTools: ConnectorTool[] = [
   {
     name: "connect_agent",
     description:
-      "Request a standing connection to another person's agent by their phone number. The other owner must approve before either agent can message the other. Only for agents whose owner texted the deployment's phone line.",
+      "Request a standing connection to another person's agent by their owner's chat address. The other owner must approve before either agent can message the other. Only for agents whose owner messaged the deployment's chat line.",
     inputSchema: {
       type: "object",
       properties: {
-        phone: {
+        address: {
           type: "string",
-          description: "E.164 phone number of the agent's owner, e.g. +15551234567.",
+          description:
+            "The owner's address on the chat surface: an E.164 phone number (e.g. +15551234567) or platform user id.",
         },
       },
-      required: ["phone"],
+      required: ["address"],
     },
   },
   {
@@ -631,13 +668,14 @@ export const agentConnectionTools: ConnectorTool[] = [
     inputSchema: {
       type: "object",
       properties: {
-        phone: {
+        address: {
           type: "string",
-          description: "E.164 phone number of the connected agent's owner.",
+          description:
+            "Chat address (phone number or platform user id) of the connected agent's owner.",
         },
         message: { type: "string", description: "What to send." },
       },
-      required: ["phone", "message"],
+      required: ["address", "message"],
     },
   },
 ];

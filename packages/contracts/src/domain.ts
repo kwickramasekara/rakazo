@@ -25,7 +25,7 @@ export type ThinkingLevel = z.infer<typeof ThinkingLevelSchema>;
 
 export const BotSchema = z.object({
   id: Id,
-  workspaceId: Id,
+  spaceId: Id,
   name: z.string(),
   title: z.string(),
   description: z.string(),
@@ -74,7 +74,7 @@ export const GROUP_MEMBER_MAX = 6;
 
 export const GroupSchema = z.object({
   id: Id,
-  workspaceId: Id,
+  spaceId: Id,
   name: z.string(),
   pinned: z.boolean(),
   sectionId: Id.nullable(),
@@ -122,6 +122,62 @@ export const BotSectionSchema = z.object({
   updatedAt: z.string(),
 });
 export type BotSection = z.infer<typeof BotSectionSchema>;
+
+/**
+ * A space is a real privacy boundary, not just sidebar organization.
+ * Bots are included so clients can keep every space visible without granting
+ * those bots access to the currently active space.
+ */
+export const SpaceBotSchema = BotSchema.pick({
+  id: true,
+  spaceId: true,
+  name: true,
+  title: true,
+  color: true,
+  notifyOnFinish: true,
+  pinned: true,
+  sectionId: true,
+  unread: true,
+  preview: true,
+  status: true,
+  updatedAt: true,
+});
+export type SpaceBot = z.infer<typeof SpaceBotSchema>;
+
+export const SpaceGroupSchema = GroupSchema.pick({
+  id: true,
+  spaceId: true,
+  name: true,
+  pinned: true,
+  sectionId: true,
+  members: true,
+  preview: true,
+  unread: true,
+  updatedAt: true,
+});
+export type SpaceGroup = z.infer<typeof SpaceGroupSchema>;
+
+export const SpaceSchema = z.object({
+  id: Id,
+  name: z.string(),
+  isDefault: z.boolean(),
+  bots: z.array(SpaceBotSchema),
+  groups: z.array(SpaceGroupSchema),
+  botSections: z.array(BotSectionSchema),
+});
+export type Space = z.infer<typeof SpaceSchema>;
+
+export const SpaceNavigationSchema = z.object({
+  current: z.object({
+    id: Id,
+    name: z.string(),
+    bots: z.array(BotSchema),
+    groups: z.array(GroupSchema),
+    botSections: z.array(BotSectionSchema),
+  }),
+  spaces: z.array(SpaceSchema),
+});
+export type SpaceNavigation = z.infer<typeof SpaceNavigationSchema>;
 
 export const BOT_NAME_MAX_LENGTH = 80;
 export const BOT_TITLE_MAX_LENGTH = 500;
@@ -477,7 +533,7 @@ export type McpServerConfigInput = z.infer<typeof McpServerConfigInput>;
 
 export const McpServerSchema = z.object({
   id: Id,
-  workspaceId: Id,
+  spaceId: Id,
   slug: z.string(),
   name: z.string(),
   description: z.string(),
@@ -554,23 +610,40 @@ export type ComputerStatus = z.infer<typeof ComputerStatusSchema>;
 export const ComputerReleaseReasonSchema = z.enum(["done", "skipped"]);
 export type ComputerReleaseReason = z.infer<typeof ComputerReleaseReasonSchema>;
 
-export const PhoneStatusSchema = z.object({
-  enabled: z.boolean(),
-  linked: z.boolean(),
-  phoneE164: z.string().nullable(),
-  botId: Id.nullable(),
+export const MessagingLinkedIdentitySchema = z.object({
+  id: Id,
+  provider: z.string(),
+  address: z.string(),
+  botId: Id,
+  botName: z.string(),
 });
-export type PhoneStatus = z.infer<typeof PhoneStatusSchema>;
+export type MessagingLinkedIdentity = z.infer<typeof MessagingLinkedIdentitySchema>;
 
-export const PhoneChannelMembershipSchema = z.object({
+export const MessagingStatusSchema = z.object({
+  enabled: z.boolean(),
+  /** Messaging platforms mounted on this deployment (sendblue, slack, …). */
+  providers: z.array(z.string()),
+  /** True when unknown senders auto-provision their own accounts. */
+  openSignup: z.boolean(),
+  /** The caller's linked chat apps, one entry per (provider, address). */
+  identities: z.array(MessagingLinkedIdentitySchema),
+});
+export type MessagingStatus = z.infer<typeof MessagingStatusSchema>;
+
+export const MessagingChannelMembershipSchema = z.object({
+  /** One row per linked identity: the same group can hold two of the caller's. */
+  id: Id,
   channelId: Id,
+  /** Which of the caller's linked chat apps this membership belongs to. */
+  identityId: Id,
+  provider: z.string(),
   name: z.string().nullable(),
   status: z.enum(["invited", "approved", "declined", "left"]),
   memberCount: z.number().int().nonnegative(),
 });
-export type PhoneChannelMembership = z.infer<typeof PhoneChannelMembershipSchema>;
+export type MessagingChannelMembership = z.infer<typeof MessagingChannelMembershipSchema>;
 
-export const PhoneAgentConnectionSchema = z.object({
+export const MessagingAgentConnectionSchema = z.object({
   id: Id,
   peerBotName: z.string(),
   peerOwnerLabel: z.string(),
@@ -578,7 +651,7 @@ export const PhoneAgentConnectionSchema = z.object({
   /** true when the caller's bot is the target (only the target can respond). */
   incoming: z.boolean(),
 });
-export type PhoneAgentConnection = z.infer<typeof PhoneAgentConnectionSchema>;
+export type MessagingAgentConnection = z.infer<typeof MessagingAgentConnectionSchema>;
 
 export const RunSchema = z.object({
   id: Id,
@@ -591,11 +664,12 @@ export const RunSchema = z.object({
     "routine",
     "resume",
     "follow_up",
+    "reaction",
     "spawn",
     "skill",
     "bot_message",
     "webhook",
-    "phone",
+    "messaging",
   ]),
   routineId: Id.nullable(),
   modelProvider: z.string().nullable(),
@@ -700,13 +774,13 @@ export const ModelOAuthBeginSchema = z.discriminatedUnion("mode", [
 ]);
 export type ModelOAuthBegin = z.infer<typeof ModelOAuthBeginSchema>;
 
-export const WorkspaceMemoryConfigSchema = z.object({
+export const SpaceMemoryConfigSchema = z.object({
   provider: z.string(),
   settings: z.record(z.string(), z.string()),
   defaultMemoryScope: MemoryScopeSchema,
   updatedAt: z.string(),
 });
-export type WorkspaceMemoryConfig = z.infer<typeof WorkspaceMemoryConfigSchema>;
+export type SpaceMemoryConfig = z.infer<typeof SpaceMemoryConfigSchema>;
 
 export const ModelCatalogEntrySchema = z.object({
   provider: z.string(),
@@ -876,7 +950,7 @@ export const MeSchema = z.object({
   userId: Id,
   email: z.string().email(),
   name: z.string(),
-  workspaceId: Id,
+  spaceId: Id,
   isDeploymentOwner: z.boolean(),
   needsModel: z.boolean(),
   defaultProvider: z.string().nullable(),
@@ -891,11 +965,13 @@ export type Me = z.infer<typeof MeSchema>;
 export const AppBootstrapSchema = z.object({
   me: MeSchema,
   bots: z.array(BotSchema),
+  groups: z.array(GroupSchema),
   botSections: z.array(BotSectionSchema),
   archivedBots: z.array(BotSchema),
   archivedGroups: z.array(GroupSchema),
   thread: ThreadSnapshotSchema.nullable(),
   routines: z.array(RoutineSchema),
+  spaces: z.array(SpaceSchema),
 });
 export type AppBootstrap = z.infer<typeof AppBootstrapSchema>;
 

@@ -383,6 +383,7 @@ export function describeToolActivity(toolName: string, args: unknown): string {
   if (toolName === "computer_observe") return "Looking at the screen";
   if (toolName === "computer_act") return "Operating the computer";
   if (toolName === "run_subagent") return `Delegating to helper: ${detail(record.name)}`;
+  if (toolName === "create_space") return `Creating space: ${detail(record.name)}`;
   if (toolName === "remember") return "Saving a note to memory";
   if (toolName === "web_search") return `Searching the web: ${detail(record.query)}`;
   if (toolName === "web_fetch") return `Reading page: ${detail(redactActivityUrl(record.url))}`;
@@ -475,6 +476,15 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
       if (tool.name === "request_takeover") {
         return { reason: String(raw.reason ?? "I need you on the screen.") };
       }
+      if (tool.name === "ask_user") {
+        const options = Array.isArray(raw.options) ? raw.options.map(String) : raw.options;
+        return {
+          question: String(raw.question ?? "What should I use?"),
+          // Keep a missing/invalid options value as-is so schema minItems can reject it;
+          // do not coerce to [] (that used to look like a valid empty list upstream).
+          options,
+        };
+      }
       if (tool.name === "request_secret") {
         return {
           label: String(raw.label ?? "Code"),
@@ -526,6 +536,9 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
           prompt: raw.prompt ? String(raw.prompt) : "",
         };
       }
+      if (tool.name === "create_space") {
+        return { name: String(raw.name ?? "") };
+      }
       if (tool.name === "archive_bot" || tool.name === "delete_bot") {
         return {
           confirm_name: String(raw.confirm_name ?? raw.confirmName ?? ""),
@@ -546,6 +559,30 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
         });
         return {
           content: [{ type: "text", text: "Takeover requested." }],
+          details: args,
+          terminate: true,
+        };
+      }
+      if (tool.name === "ask_user") {
+        const options = Array.isArray(args.options)
+          ? args.options.map((option) => String(option).trim())
+          : [];
+        if (
+          options.length < 2 ||
+          options.length > 4 ||
+          options.some((option) => option.length === 0 || option.length > 80) ||
+          new Set(options).size !== options.length
+        ) {
+          throw new Error("ask_user requires two to four unique, non-empty options");
+        }
+        host.pausePending = true;
+        host.queue.push({
+          type: "ask",
+          text: String(args.question ?? "What should I use?"),
+          actions: options.map((label, index) => ({ id: `choice-${index + 1}`, label })),
+        });
+        return {
+          content: [{ type: "text", text: "Waiting for the user's choice." }],
           details: args,
           terminate: true,
         };
@@ -764,6 +801,16 @@ function parametersFor(tool: ConnectorTool) {
       connectionId: Type.Optional(Type.String()),
     });
   }
+  if (tool.name === "ask_user") {
+    return Type.Object({
+      question: Type.String({ maxLength: 240 }),
+      options: Type.Array(Type.String({ minLength: 1, maxLength: 80 }), {
+        minItems: 2,
+        maxItems: 4,
+        uniqueItems: true,
+      }),
+    });
+  }
   if (tool.name === "remember") {
     return Type.Object({ content: Type.String(), path: Type.String() });
   }
@@ -787,6 +834,9 @@ function parametersFor(tool: ConnectorTool) {
       instructions: Type.Optional(Type.String()),
       prompt: Type.Optional(Type.String()),
     });
+  }
+  if (tool.name === "create_space") {
+    return Type.Object({ name: Type.String({ minLength: 1, maxLength: 60 }) });
   }
   if (tool.name === "archive_bot" || tool.name === "delete_bot") {
     return Type.Object({
@@ -878,7 +928,17 @@ function jsonField(spec: unknown): ReturnType<typeof Type.String> {
   const type = "type" in definition ? String(definition.type) : "string";
   if (type === "number" || type === "integer") return Type.Number() as never;
   if (type === "boolean") return Type.Boolean() as never;
-  if (type === "array") return Type.Array(jsonField(definition.items)) as never;
+  if (type === "array") {
+    const options: {
+      minItems?: number;
+      maxItems?: number;
+      uniqueItems?: boolean;
+    } = {};
+    if (typeof definition.minItems === "number") options.minItems = definition.minItems;
+    if (typeof definition.maxItems === "number") options.maxItems = definition.maxItems;
+    if (definition.uniqueItems === true) options.uniqueItems = true;
+    return Type.Array(jsonField(definition.items), options) as never;
+  }
   if (type === "object") return jsonSchemaParameters(definition) as never;
   return Type.String();
 }

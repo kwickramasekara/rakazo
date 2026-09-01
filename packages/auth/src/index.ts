@@ -1,5 +1,5 @@
 import { emailAllowed, parseAllowlist, signupPolicyFromEnv } from "@rakazo/core";
-import { bootstrapUserWorkspace, type PrismaClient } from "@rakazo/db";
+import { bootstrapUserSpace, type PrismaClient } from "@rakazo/db";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { APIError } from "better-auth/api";
@@ -68,9 +68,9 @@ export function createAuth(prisma: PrismaClient, env: AuthEnv) {
               where: { ownerUserId: user.id },
               data: { ownerUserId: null },
             }),
-            // Phone identities are deliberately FK-free, so clear them here
-            // or the unique phoneE164 would point at a deleted bot forever.
-            prisma.phoneIdentity.deleteMany({
+            // Messaging identities are deliberately FK-free, so clear them
+            // here or the unique address would point at a deleted bot forever.
+            prisma.messagingIdentity.deleteMany({
               where: { userId: user.id },
             }),
             prisma.organization.deleteMany({
@@ -108,7 +108,7 @@ export function createAuth(prisma: PrismaClient, env: AuthEnv) {
       user: {
         create: {
           after: async (user) => {
-            await bootstrapUserWorkspace(prisma, user, env);
+            await bootstrapUserSpace(prisma, user, env);
           },
         },
       },

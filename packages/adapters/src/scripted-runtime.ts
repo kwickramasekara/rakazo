@@ -94,7 +94,12 @@ export class ScriptedAgentRuntime implements AgentRuntime {
           };
         }
         if (turn.ask) {
-          yield { type: "ask", text: turn.ask.text, detail: turn.ask.detail };
+          yield {
+            type: "ask",
+            text: turn.ask.text,
+            detail: turn.ask.detail,
+            actions: turn.ask.actions,
+          };
           return;
         }
         if (turn.takeover) {
@@ -141,6 +146,51 @@ export function inferScript(
         assistant:
           "signed in. the session stays in this computer — protected input never hit the thread.",
         complete: true,
+      },
+    ];
+  }
+  // Before every content-based intent so payload text cannot steal the branch.
+  if (lower.includes("message the bot named") || lower.includes("message bot named")) {
+    const name = namedBot(prompt) ?? "Peer";
+    const message =
+      /named\s+[A-Za-z0-9][A-Za-z0-9_-]{0,39}\s+(?:saying|with|:)\s*([\s\S]+)$/i
+        .exec(prompt)?.[1]
+        ?.trim() ?? `Please help with: ${prompt}`;
+    return [
+      {
+        assistant: "messaging that bot now.",
+        toolCalls: [
+          {
+            name: "message_bot",
+            args: {
+              confirm_name: name,
+              message,
+              intent: "request",
+            },
+          },
+        ],
+        complete: true,
+      },
+    ];
+  }
+  if (
+    lower.includes("tappable choices") ||
+    lower.includes("choice buttons") ||
+    lower.includes("pick from these cities")
+  ) {
+    return [
+      {
+        assistant: "pick one to continue.",
+        ask: {
+          text: "Which city should I use?",
+          detail: "Tap one option.",
+          actions: [
+            { id: "choice-1", label: "Berlin" },
+            { id: "choice-2", label: "Seoul" },
+            { id: "choice-3", label: "Toronto" },
+            { id: "choice-4", label: "Lisbon" },
+          ],
+        },
       },
     ];
   }
@@ -195,6 +245,21 @@ export function inferScript(
       {
         assistant: "archiving that bot.",
         toolCalls: [{ name: "archive_bot", args: { confirm_name: name } }],
+        complete: true,
+      },
+    ];
+  }
+  if (
+    lower.includes("create a space") ||
+    lower.includes("create space") ||
+    lower.includes("new space named") ||
+    lower.includes("new private space")
+  ) {
+    const name = namedSpace(prompt) ?? "New space";
+    return [
+      {
+        assistant: "i can create that separate space after you confirm the boundary.",
+        toolCalls: [{ name: "create_space", args: { name } }],
         complete: true,
       },
     ];
@@ -351,6 +416,13 @@ function shouldHang(prompt: string): boolean {
 
 function namedBot(prompt: string) {
   return /named\s+([A-Za-z0-9][A-Za-z0-9_-]{0,39})/i.exec(prompt)?.[1];
+}
+
+function namedSpace(prompt: string) {
+  return /space\s+(?:named|called)\s+["“]?([^"”\n]{1,60})/i
+    .exec(prompt)?.[1]
+    ?.replace(/[.!?]+$/, "")
+    .trim();
 }
 
 function summarize(prompt: string): string {

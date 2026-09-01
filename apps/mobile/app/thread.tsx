@@ -6,6 +6,7 @@ import type {
   MessageBlock,
   Routine,
 } from "@rakazo/contracts";
+import { canReactToThreadMessage } from "@rakazo/contracts";
 import {
   abortableDelay,
   attachmentsForThread,
@@ -19,13 +20,16 @@ import {
   resolveComposerSendPlan,
   SLASH_ACTIONS,
   type SlashActionId,
+  selectedAskActionLabel,
   serializeComposerPrompt,
   truncateSlashDescription,
+  userVisibleMessages,
 } from "@rakazo/core";
 import { Link, useFocusEffect, useLocalSearchParams, useNavigation, useRouter } from "expo-router";
 import { useHeaderHeight } from "expo-router/react-navigation";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   AppState,
   FlatList,
@@ -60,8 +64,11 @@ import {
   type MobileMessagePage,
   type MobileSnapshot,
   mergeMobileSnapshot,
+  messagingProviderLabel,
   prependMobileMessagePage,
   rpc,
+  selectedSpaceId,
+  selectSpace,
   shouldApplyMobileThreadRefresh,
   subscribeThread,
 } from "../lib/api";
@@ -91,9 +98,10 @@ import {
   ThreadScrollBehavior,
   type ThreadScrollState,
 } from "../lib/thread-scroll";
-import { playMpeg, speakUtterance } from "../lib/voice";
+import { speakText } from "../lib/voice";
 
 type PendingAttachment = PickedAttachment & { threadKey: string };
+type AskAction = NonNullable<Extract<MessageBlock, { kind: "ask" }>["actions"]>[number];
 
 function newClientNonce(): string {
   const webCrypto = globalThis.crypto;
@@ -103,19 +111,80 @@ function newClientNonce(): string {
   return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function formatApprovalAnswer(answer: string | undefined): string {
+function formatApprovalAnswer(
+  answer: string | undefined,
+  actions: AskAction[] | undefined,
+  approval: boolean,
+): string {
   if (!answer) return "Answered";
-  if (answer === "allow") return "Allowed once";
-  if (answer === "always") return "Always allowed";
-  if (answer === "deny") return "Denied";
-  return `Answered: ${answer}`;
+  const selectedAction = actions?.find((action) => action.id === answer);
+  const outcome = selectedAction?.outcome;
+  if (approval && outcome === "created") return "Created";
+  if (approval && outcome === "cancelled") return "Cancelled";
+  if (approval && answer === "allow") return "Allowed once";
+  if (approval && answer === "always") return "Always allowed";
+  if (approval && answer === "deny") return "Denied";
+  return `Answered: ${selectedAskActionLabel(answer, actions)}`;
 }
 
 function isWorkingStatus(status: string | undefined): boolean {
   return status === "queued" || status === "leased" || status === "running";
 }
 
-export default function Thread() {
+type NotificationRouteState = "loading" | "ready" | "failed";
+
+export default function ThreadRoute() {
+  const router = useRouter();
+  const { spaceId } = useLocalSearchParams<{ spaceId?: string | string[] }>();
+  const requestedSpaceId = typeof spaceId === "string" && spaceId ? spaceId : null;
+  const invalidSpaceId = spaceId !== undefined && requestedSpaceId === null;
+  const routeMatchesSelectedSpace =
+    requestedSpaceId === null || selectedSpaceId() === requestedSpaceId;
+  const [routeState, setRouteState] = useState<NotificationRouteState>(() => {
+    if (invalidSpaceId) return "failed";
+    return routeMatchesSelectedSpace ? "ready" : "loading";
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    if (invalidSpaceId) {
+      setRouteState("failed");
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (!requestedSpaceId || selectedSpaceId() === requestedSpaceId) {
+      setRouteState("ready");
+      return () => {
+        cancelled = true;
+      };
+    }
+    setRouteState("loading");
+    void selectSpace(requestedSpaceId).then((selected) => {
+      if (!cancelled) setRouteState(selected ? "ready" : "failed");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [invalidSpaceId, requestedSpaceId]);
+
+  if (routeState === "ready" && !invalidSpaceId && routeMatchesSelectedSpace) return <Thread />;
+  return (
+    <View
+      style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#000" }}
+    >
+      {routeState === "loading" ? (
+        <ActivityIndicator color="#ECECEE" />
+      ) : (
+        <Pressable accessibilityRole="button" onPress={() => router.replace("/")}>
+          <Text style={{ color: "#ECECEE", fontSize: 16 }}>Return to inbox</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+function Thread() {
   const navigation = useNavigation();
   const router = useRouter();
   const headerHeight = useHeaderHeight();
@@ -134,6 +203,7 @@ export default function Thread() {
   const loadingOlderContent = useRef(false);
   const expandedHistoryThread = useRef<string | null>(null);
   const historyEpoch = useRef(0);
+  const jumpGeneration = useRef(0);
   const pinnedAroundRef = useRef<{
     botId?: string;
     groupId?: string;
@@ -195,7 +265,10 @@ export default function Thread() {
     null,
   );
   const visibleMessages = useMemo(
-    () => (snap?.messages ?? []).filter((message) => hasVisibleMessagePresentation(message.blocks)),
+    () =>
+      userVisibleMessages(snap?.messages ?? [], { includePeerReceipts: true }).filter((message) =>
+        hasVisibleMessagePresentation(message.blocks),
+      ),
     [snap?.messages],
   );
   const latestMessageId = visibleMessages.at(-1)?.id ?? null;
@@ -501,6 +574,8 @@ export default function Thread() {
   async function applyMessageJump(target: { botId?: string; groupId?: string; messageId: string }) {
     const threadTarget = target.groupId ? { groupId: target.groupId } : { botId: target.botId! };
     const epoch = historyEpoch.current;
+    jumpGeneration.current += 1;
+    const jumpId = jumpGeneration.current;
     const [snap, page] = await Promise.all([
       rpc<MobileSnapshot>("threads/get", threadTarget),
       rpc<MobileMessagePage>("threads/messages", {
@@ -508,24 +583,27 @@ export default function Thread() {
         around: { messageId: target.messageId },
       }),
     ]);
-    // The epoch check drops a jump that raced a conversation clear (or a bot switch): applying
-    // the fetched page would pin deleted messages that every later refresh keeps restoring.
-    if (epoch !== historyEpoch.current) return;
+    // The epoch check drops a jump that raced a conversation clear (or a bot switch); the
+    // generation check drops an older same-thread jump that finished after a newer one.
+    if (epoch !== historyEpoch.current || jumpId !== jumpGeneration.current) return;
     if (target.groupId && activeGroupId.current !== target.groupId) return;
     if (target.botId && activeBotId.current !== target.botId) return;
-    expandedHistoryThread.current = page.threadId;
-    pinnedAroundRef.current = {
-      ...threadTarget,
-      messageId: target.messageId,
-      threadId: page.threadId,
-      messages: [...page.messages],
-      olderCursor: page.olderCursor,
-    };
-    jumpScrollTarget.current = target.messageId;
+    const targetInPage = page.messages.some((message) => message.id === target.messageId);
+    expandedHistoryThread.current = targetInPage ? page.threadId : null;
+    pinnedAroundRef.current = targetInPage
+      ? {
+          ...threadTarget,
+          messageId: target.messageId,
+          threadId: page.threadId,
+          messages: [...page.messages],
+          olderCursor: page.olderCursor,
+        }
+      : null;
+    jumpScrollTarget.current = targetInPage ? target.messageId : null;
     setSnap({
       ...snap,
-      messages: [...page.messages],
-      olderCursor: page.olderCursor,
+      messages: targetInPage ? [...page.messages] : snap.messages,
+      olderCursor: targetInPage ? page.olderCursor : snap.olderCursor,
     });
   }
 
@@ -538,6 +616,7 @@ export default function Thread() {
       const page = await rpc<MobileMessagePage>("threads/messages", {
         ...(groupId ? { groupId } : { botId: botId! }),
         before: snap.olderCursor,
+        includePeerReceipts: true,
       });
       if (epoch !== historyEpoch.current) {
         loadingOlderContent.current = false;
@@ -652,6 +731,7 @@ export default function Thread() {
                 event.type === "agent.tool.called" ||
                 event.type === "thread.message.created" ||
                 event.type === "thread.message.updated" ||
+                event.type === "thread.message.reaction" ||
                 event.type === "thread.subagent" ||
                 event.type === "thread.cleared" ||
                 event.type === "run.waiting_input" ||
@@ -886,7 +966,7 @@ export default function Thread() {
             },
       );
       void loadSessionToken()
-        .then((token) => resumeLiveNotifications(currentApiBase(), token))
+        .then((token) => resumeLiveNotifications(currentApiBase(), token, selectedSpaceId() ?? ""))
         .catch(() => undefined);
       clearOriginComposer();
       if (reroutedToGroup && groupTarget) {
@@ -1011,6 +1091,22 @@ export default function Thread() {
     );
   }
 
+  async function reactToMessage(message: MobileMessage) {
+    const targetBotId = botId;
+    const targetGroupId = groupId;
+    if (!targetBotId && !targetGroupId) return;
+    try {
+      await rpc("threads/react", {
+        ...(targetGroupId ? { groupId: targetGroupId } : { botId: targetBotId! }),
+        messageId: message.id,
+        thumbsUp: !message.thumbsUp,
+      });
+    } catch (err) {
+      if (!isCurrentTarget(targetBotId, targetGroupId)) return;
+      setError(err instanceof Error ? err.message : "Could not update reaction");
+    }
+  }
+
   function renderMessageRow(message: MobileMessage, options?: { enableJump?: boolean }) {
     const ownerId = toolOwnerId(message, inGroup);
     const activityBotId =
@@ -1073,21 +1169,36 @@ export default function Thread() {
             flexShrink: 1,
           }}
         >
-          <Pressable
-            accessibilityLabel="Reply"
-            onPress={() => setReplyTarget(message)}
+          <View
             style={{
               alignSelf: message.role === "user" ? "flex-end" : "flex-start",
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 12,
               marginBottom: 4,
             }}
           >
-            <Text style={{ color: "#6C6C70", fontSize: 12 }}>Reply</Text>
-          </Pressable>
+            <Pressable accessibilityLabel="Reply" onPress={() => setReplyTarget(message)}>
+              <Text style={{ color: "#6C6C70", fontSize: 12 }}>Reply</Text>
+            </Pressable>
+            {canReactToThreadMessage(message) ? (
+              <Pressable
+                accessibilityLabel={message.thumbsUp ? "Remove thumbs-up" : "Add thumbs-up"}
+                accessibilityState={{ selected: Boolean(message.thumbsUp) }}
+                onPress={() => void reactToMessage(message)}
+              >
+                <Text style={{ color: message.thumbsUp ? "#E9C46A" : "#6C6C70", fontSize: 13 }}>
+                  👍
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
           <MessageBubble
             botId={botId ?? snap?.members?.[0]?.botId ?? ""}
             groupId={groupId}
             message={message}
             botName={name}
+            bots={mentionBots}
             members={snap?.members}
             replyPreview={
               message.replyToMessageId ? messagesById.get(message.replyToMessageId) : undefined
@@ -1735,8 +1846,8 @@ function MentionChipIcon({ mention }: { mention: ComposerMention }) {
 function previewMessageText(message: MobileMessage): string {
   const text = message.blocks
     .flatMap((block) => {
-      if (block.kind === "phone_channel_message" && block.text) {
-        return [`iMessage · ${block.fromLabel}: ${block.text}`];
+      if (block.kind === "channel_message" && block.text) {
+        return [`${messagingProviderLabel(block.provider)} · ${block.fromLabel}: ${block.text}`];
       }
       return block.kind === "text" && block.text ? [block.text] : [];
     })
@@ -1760,19 +1871,15 @@ function memberName(
 async function speakMessage(botId: string, message: MobileMessage) {
   const text = blockText(message);
   if (!text.trim()) return;
-  const prepared = await rpc<{ ready: boolean; utterances: string[] }>("voice/prepare", {
-    text,
-    botId,
-  });
-  if (!prepared.ready) throw new Error("Add a voice provider in Voice settings.");
-  for (const utterance of prepared.utterances) {
-    await playMpeg(await speakUtterance(utterance, { botId }));
+  if (!(await speakText(text, { botId }))) {
+    throw new Error("Add a voice provider in Voice settings.");
   }
 }
 
 const MessageBubble = memo(function MessageBubble({
   botId,
   botName,
+  bots,
   groupId,
   message,
   members,
@@ -1785,6 +1892,7 @@ const MessageBubble = memo(function MessageBubble({
 }: {
   botId: string;
   botName?: string;
+  bots: MobileBot[];
   groupId?: string;
   message: MobileMessage;
   members?: MobileSnapshot["members"];
@@ -1804,7 +1912,7 @@ const MessageBubble = memo(function MessageBubble({
   );
   const ask = message.blocks.find(
     (block): block is Extract<MessageBlock, { kind: "ask" }> =>
-      block.kind === "ask" && !isApprovalAskBlock(block),
+      block.kind === "ask" && !isApprovalAskBlock(block) && !block.actions?.length,
   );
   if (ask) {
     return (
@@ -1842,24 +1950,44 @@ const MessageBubble = memo(function MessageBubble({
   if (peerMessage) {
     const sent = peerMessage.kind === "bot_message_sent";
     const peer = sent ? peerMessage.toBotName : peerMessage.fromBotName;
+    const peerBotId = sent ? peerMessage.toBotId : peerMessage.fromBotId;
+    const label = sent ? `Messaged ${peer}` : `Message from ${peer}`;
+    const peerColor =
+      bots.find((bot) => bot.id === peerBotId)?.color ??
+      members?.find((member) => member.botId === peerBotId)?.color ??
+      "#85858A";
+    // Compact receipt only: peer bodies stay out of the human thread.
+    // Full view-only peer chat is web-first; mobile keeps the chip without expand.
     return (
-      <AgentEventLabel
-        label={sent ? `Messaged ${peer}` : `Message from ${peer}`}
-        detail={peerMessage.text}
-        expanded={peerExpanded}
-        onToggle={() => setPeerExpanded((expanded) => !expanded)}
-      />
+      <View
+        accessible
+        accessibilityLabel={label}
+        style={{
+          width: "100%",
+          paddingVertical: 4,
+          alignItems: "center",
+          justifyContent: "flex-start",
+          flexDirection: "row",
+          gap: 6,
+        }}
+      >
+        <BotAvatar color={peerColor} identity={peerBotId} size={16} />
+        <Text numberOfLines={1} style={{ color: "#85858A", fontSize: 13.5, flexShrink: 1 }}>
+          {label}
+        </Text>
+      </View>
     );
   }
-  const phoneChannel = message.blocks.find(
-    (block): block is Extract<MessageBlock, { kind: "phone_channel_message" }> =>
-      block.kind === "phone_channel_message",
+  const channelMessage = message.blocks.find(
+    (block): block is Extract<MessageBlock, { kind: "channel_message" }> =>
+      block.kind === "channel_message",
   );
-  if (phoneChannel) {
+  if (channelMessage) {
     return (
       <View style={{ width: "100%", paddingVertical: 4, alignItems: "center" }}>
         <Text style={{ color: "#85858A", fontSize: 13.5, textAlign: "center" }}>
-          iMessage · {phoneChannel.fromLabel}: {phoneChannel.text}
+          {messagingProviderLabel(channelMessage.provider)} · {channelMessage.fromLabel}:{" "}
+          {channelMessage.text}
         </Text>
       </View>
     );
@@ -1975,7 +2103,9 @@ const MessageBubble = memo(function MessageBubble({
       </View>
     );
   }
-  const askBlock = message.blocks.find(isApprovalAskBlock);
+  const askBlock = message.blocks.find(
+    (block) => block.kind === "ask" && Boolean(block.actions?.length),
+  );
   if (askBlock?.kind === "ask" && askBlock.actions?.length) {
     return (
       <View style={{ gap: 8, width: "100%" }}>
@@ -2017,7 +2147,11 @@ const MessageBubble = memo(function MessageBubble({
                 fontWeight: "600",
               }}
             >
-              {formatApprovalAnswer(askBlock.answer)}
+              {formatApprovalAnswer(
+                askBlock.answer,
+                askBlock.actions,
+                isApprovalAskBlock(askBlock),
+              )}
             </Text>
           ) : canAnswer && onAnswer ? (
             <AskActions
@@ -2041,8 +2175,8 @@ const MessageBubble = memo(function MessageBubble({
   );
   const caption = message.blocks
     .flatMap((block) => {
-      if (block.kind === "phone_channel_message" && block.text) {
-        return [`iMessage · ${block.fromLabel}: ${block.text}`];
+      if (block.kind === "channel_message" && block.text) {
+        return [`${messagingProviderLabel(block.provider)} · ${block.fromLabel}: ${block.text}`];
       }
       return block.kind === "text" && block.text ? [block.text] : [];
     })
@@ -2169,7 +2303,11 @@ const MessageBubble = memo(function MessageBubble({
     <View style={{ gap: 8, width: "100%" }}>
       {segments.map((segment, index) =>
         segment.kind === "tool" ? (
-          <ExpandableToolBlock key={`${message.id}-tools-${index}`} block={segment.block} />
+          <ExpandableToolBlock
+            key={`${message.id}-${message.id.startsWith("progress:") ? "working" : "actions"}-${index}`}
+            block={segment.block}
+            live={message.id.startsWith("progress:")}
+          />
         ) : (
           <MessageTextCard
             key={`${message.id}-content-${index}`}
@@ -2284,8 +2422,10 @@ function AgentEventLabel({
 
 function ExpandableToolBlock({
   block,
+  live,
 }: {
   block: Extract<MessageBlock, { kind: "progress" | "steps" }>;
+  live: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const provider =
@@ -2299,7 +2439,7 @@ function ExpandableToolBlock({
             : []),
           ...(block.pendingToolNames ?? []),
         ].filter(Boolean);
-  const title = provider ? `Using ${provider}` : "Tools";
+  const title = live ? "Working…" : "Actions";
 
   return (
     <View
@@ -2310,7 +2450,9 @@ function ExpandableToolBlock({
     >
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={expanded ? "Hide tool details" : "Show tool details"}
+        accessibilityLabel={`${expanded ? "Hide" : "Show"} ${title}`}
+        accessibilityState={{ expanded }}
+        hitSlop={10}
         onPress={() => setExpanded((current) => !current)}
         style={{
           flexDirection: "row",
@@ -2319,7 +2461,9 @@ function ExpandableToolBlock({
           paddingVertical: 2,
         }}
       >
-        <Text style={{ color: "#85858A", fontSize: 12.5, fontWeight: "600" }}>{title}</Text>
+        <Text style={{ color: live ? "#C9C9CE" : "#85858A", fontSize: 12.5, fontWeight: "600" }}>
+          {title}
+        </Text>
         <Text style={{ color: "#6C6C70", fontSize: 12 }}>{expanded ? "⌃" : "⌄"}</Text>
       </Pressable>
       {expanded ? (
