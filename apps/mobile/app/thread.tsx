@@ -22,6 +22,7 @@ import {
   type SlashActionId,
   selectedAskActionLabel,
   serializeComposerPrompt,
+  toolActivityLabel,
   truncateSlashDescription,
   userVisibleMessages,
 } from "@rakazo/core";
@@ -128,7 +129,13 @@ function formatApprovalAnswer(
 }
 
 function isWorkingStatus(status: string | undefined): boolean {
-  return status === "queued" || status === "leased" || status === "running";
+  return (
+    status === "queued" ||
+    status === "leased" ||
+    status === "running" ||
+    status === "waiting_input" ||
+    status === "waiting_takeover"
+  );
 }
 
 type NotificationRouteState = "loading" | "ready" | "failed";
@@ -343,6 +350,7 @@ function Thread() {
       return [{ ...member, status: run.status }];
     });
   }, [inGroup, snap?.activeRuns, snap?.members, snap?.run]);
+  const working = inGroup ? workingGroupBots.length > 0 : isWorkingStatus(currentBotStatus);
 
   useEffect(() => {
     void rpc<AgentSkillCatalogEntry[]>("agentSkills/list")
@@ -947,11 +955,13 @@ function Thread() {
         });
         artifactIds.push(artifact.id);
       }
+      const clientNonce = newClientNonce();
       await rpc(
         "threads/send",
         groupTarget
           ? {
               groupId: groupTarget,
+              clientNonce,
               text: trimmed || undefined,
               mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
               artifactIds: artifactIds.length ? artifactIds : undefined,
@@ -959,6 +969,7 @@ function Thread() {
             }
           : {
               botId: botTarget!,
+              clientNonce,
               text: trimmed || undefined,
               mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
               artifactIds: artifactIds.length ? artifactIds : undefined,
@@ -987,6 +998,36 @@ function Thread() {
         setError(err instanceof Error ? err.message : "Failed to send message");
       } else if (isCurrentTarget(botTarget, groupTarget)) {
         setError(err instanceof Error ? err.message : "Failed to send message");
+      }
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function stop() {
+    const targetBotId = botId;
+    const targetGroupId = groupId;
+    if ((!targetBotId && !targetGroupId) || sending) return;
+    setSending(true);
+    setError(null);
+    try {
+      await rpc(
+        "threads/stop",
+        targetGroupId ? { groupId: targetGroupId } : { botId: targetBotId! },
+      );
+    } catch (err) {
+      if (isCurrentTarget(targetBotId, targetGroupId)) {
+        setError(err instanceof Error ? err.message : "Failed to stop work");
+      }
+      setSending(false);
+      return;
+    }
+    try {
+      await refresh();
+    } catch (err) {
+      if (isCurrentTarget(targetBotId, targetGroupId)) {
+        const detail = err instanceof Error ? err.message : "Failed to refresh";
+        setError(`Work stopped, but the thread could not refresh: ${detail}`);
       }
     } finally {
       setSending(false);
@@ -1288,7 +1329,7 @@ function Thread() {
       style={{ flex: 1, backgroundColor: "#000", paddingHorizontal: 20 }}
     >
       {error ? <Text style={{ color: "#8E8E93", marginTop: 12 }}>{error}</Text> : null}
-      {runError ? <Text style={{ color: "#E65707", marginTop: 12 }}>{runError}</Text> : null}
+      {runError ? <Text style={{ color: "#EF4444", marginTop: 12 }}>{runError}</Text> : null}
       <View style={{ flex: 1, position: "relative" }}>
         {showPinnedPage ? (
           <ScrollView
@@ -1673,7 +1714,7 @@ function Thread() {
             <TextInput
               value={draft}
               onChangeText={updateDraft}
-              accessibilityLabel="Message"
+              accessibilityLabel={name ? `Message ${name}` : "Message"}
               onKeyPress={(event) => {
                 if (
                   event.nativeEvent.key === "Backspace" &&
@@ -1683,7 +1724,13 @@ function Thread() {
                   removeLastChip();
                 }
               }}
-              placeholder={selectedSkill || selectedMentions.length ? undefined : "Message…"}
+              placeholder={
+                selectedSkill || selectedMentions.length
+                  ? undefined
+                  : name
+                    ? `Message ${name}`
+                    : "Message…"
+              }
               placeholderTextColor="#6C6C70"
               keyboardAppearance="dark"
               multiline
@@ -1701,6 +1748,7 @@ function Thread() {
             />
           </View>
           <Pressable
+            accessibilityLabel="Send"
             disabled={sending || !canSend}
             onPress={() => void send()}
             style={{
@@ -1715,6 +1763,25 @@ function Thread() {
           >
             <NativeSymbol ios="arrow.up" android="arrow-up" size={18} color="#17171A" />
           </Pressable>
+          {working ? (
+            <Pressable
+              accessibilityLabel="Stop"
+              disabled={sending}
+              onPress={() => void stop()}
+              style={{
+                borderColor: "#34343A",
+                borderWidth: 1,
+                borderRadius: 22,
+                width: 44,
+                height: 44,
+                alignItems: "center",
+                justifyContent: "center",
+                opacity: sending ? 0.5 : 1,
+              }}
+            >
+              <NativeSymbol ios="stop.fill" android="stop" size={15} color="#C9C9CE" />
+            </Pressable>
+          ) : null}
         </View>
         {!inGroup ? (
           <Link
@@ -2022,7 +2089,7 @@ const MessageBubble = memo(function MessageBubble({
           </Text>
           <Text
             style={{
-              color: failed ? "#E65707" : running ? "#F5A03C" : "#4ECB71",
+              color: failed ? "#EF4444" : running ? "#F5A03C" : "#4ECB71",
               fontSize: 13,
             }}
           >
@@ -2069,7 +2136,7 @@ const MessageBubble = memo(function MessageBubble({
           <Text style={{ color: "#ECECEE", fontSize: 15, fontWeight: "600" }}>
             {special.name || "Bot"}
           </Text>
-          <Text style={{ color: removed ? "#E65707" : "#4ECB71", fontSize: 13 }}>
+          <Text style={{ color: removed ? "#EF4444" : "#4ECB71", fontSize: 13 }}>
             {special.status === "archived"
               ? "archived"
               : special.status === "deleted"
@@ -2439,7 +2506,7 @@ function ExpandableToolBlock({
             : []),
           ...(block.pendingToolNames ?? []),
         ].filter(Boolean);
-  const title = live ? "Working…" : "Actions";
+  const title = toolActivityLabel(block.kind === "steps" ? block.durationMs : undefined, live);
 
   return (
     <View
@@ -2583,7 +2650,7 @@ function AskBlock({
       ) : (
         <Text style={{ color: "#85858A", fontSize: 13.5 }}>Waiting for this bot’s response.</Text>
       )}
-      {error ? <Text style={{ color: "#E65707", fontSize: 13 }}>{error}</Text> : null}
+      {error ? <Text style={{ color: "#EF4444", fontSize: 13 }}>{error}</Text> : null}
     </View>
   );
 }
