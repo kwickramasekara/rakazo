@@ -21,6 +21,65 @@ The installer downloads `docker-compose.images.yml` and `.env.images.example`, c
 random secrets, then pulls and starts the images. It preserves an existing `.env` when rerun. To
 customize the public URL, image tag, or optional providers before startup, run
 `bash install-images.sh --prepare-only`, edit `.env`, then run `bash install-images.sh`.
+Flags may be combined in either order: `--prepare-only`, `--local`.
+
+### Restricted networks / mirror downloads
+
+Stage B of the installer (Compose YAML and `.env.images.example`) downloads from
+`DOWNLOAD_BASE`. Override it with a generic HTTPS mirror of `infra/compose` — do not rely on
+vendor-specific CDN defaults:
+
+```bash
+export RAKAZO_DOWNLOAD_BASE=https://example.com/mirror/rakazo/infra/compose
+bash install-images.sh
+```
+
+Trailing slashes on `RAKAZO_DOWNLOAD_BASE` are trimmed; non-HTTPS bases are rejected. Downloads
+use finite curl retries (`--retry 3 --retry-delay 2 --retry-all-errors` when supported).
+
+To reuse files already present in the working directory (skip curl when the target exists), set
+`RAKAZO_DOWNLOAD_SKIP_EXISTING=1` and/or pass `--local`:
+
+```bash
+# after placing docker-compose.images.yml and .env.images.example locally
+bash install-images.sh --local --prepare-only
+# or
+RAKAZO_DOWNLOAD_SKIP_EXISTING=1 bash install-images.sh --prepare-only
+```
+
+If skip mode is on and a required file is missing, the installer still downloads it (or fails with
+the URL in the error).
+
+Stage A (fetching `install-images.sh` itself) is separate. When raw GitHub is unreachable, point the
+bootstrap curl at your mirror of the installer script, for example:
+
+```bash
+export RAKAZO_INSTALLER_URL=https://example.com/mirror/rakazo/infra/compose/install-images.sh
+mkdir -p rakazo && cd rakazo &&
+curl -fsSLO "${RAKAZO_INSTALLER_URL}" &&
+bash install-images.sh
+```
+
+Stage C (`docker compose pull`) uses `RAKAZO_IMAGE`, `RAKAZO_IMAGE_TAG`,
+`RAKAZO_COMPUTER_IMAGE`, and `RAKAZO_COMPUTER_IMAGE_TAG` (defaults
+`ghcr.io/elie222/rakazo/{app,computer}`). When GHCR is unreachable, override those
+four in `.env` to a registry you control — keep app and computer on the same
+mirror. Do not rely on vendor-specific CDN defaults:
+
+```env
+RAKAZO_IMAGE=registry.example.com/mirror/elie222/rakazo/app
+RAKAZO_IMAGE_TAG=edge
+RAKAZO_COMPUTER_IMAGE=registry.example.com/mirror/elie222/rakazo/computer
+RAKAZO_COMPUTER_IMAGE_TAG=edge
+```
+
+After `--prepare-only`, edit `.env` then rerun `bash install-images.sh` (or
+`docker compose --env-file .env -f docker-compose.images.yml pull`). Arm64 tag
+pairing is unchanged — set both tags to the same published multi-arch release
+(see [Published images and tags](#published-images-and-tags)).
+
+`postgres:16` and `busybox:1` still pull from Docker Hub. Stage C does not cover
+them; configure the Docker daemon `registry-mirrors` or vendor those images.
 
 `SANDBOX_PROVIDER` defaults to `docker`. The images Compose file runs a sandbox supervisor
 (from the app image, on the internal network only) and pulls `ghcr.io/elie222/rakazo/computer`.
@@ -38,9 +97,23 @@ published.
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The first registered user becomes the
 deployment owner. Put TLS in front of `:5173` for a public host and set the three public origins to
-that HTTPS URL. Open **Agent computer** on a bot, or send a message that uses the desktop, to see
-the local Docker computer. For automatic HTTPS via Caddy and remote E2B computers, use the
-production Compose path below.
+that HTTPS URL.
+
+Images Compose binds web to loopback (`127.0.0.1:5173`). Terminate TLS on the host and proxy
+there. Vite preview same-origin-proxies `/api` and `/rpc`, so do not expose `:3100`. Set
+`BETTER_AUTH_URL`, `WEB_ORIGIN`, and `API_URL` to that same HTTPS origin, and set
+`RAKAZO_HOST` to its hostname (for example, `app.example.com`).
+
+```Caddyfile
+app.example.com {
+	reverse_proxy 127.0.0.1:5173
+}
+```
+
+Open **Agent computer** on a bot, or send a message that uses the desktop, to see
+the local Docker computer. For in-stack Caddy plus remote E2B computers, use the
+[production Compose](#public-single-vm-deployment) path and `infra/compose/Caddyfile.prod`
+instead of this host proxy.
 
 ## Docker Compose (single machine)
 
