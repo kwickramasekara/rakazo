@@ -25,7 +25,9 @@ import {
   ComputerBusyError,
   type ComputerExecutionLease,
   type ConnectorRegistry,
+  cancelComputerRunWork,
   checkpointAndRecordComputerWorkspace,
+  clearInactiveUserComputerControl,
   computerSupportsUpdate,
   createVoiceProvider,
   deletePushToken,
@@ -37,6 +39,7 @@ import {
   expireComputerControl,
   hasActiveComputerControl,
   isAutoReviewCheckerConfigured,
+  isComputerScreenUnavailable,
   isSandboxGoneError,
   isScratchpadStatus,
   listPiCatalog,
@@ -334,6 +337,7 @@ export interface RouterDeps {
   /** Present when the external messaging surface is enabled. */
   messaging?: { enabled: boolean; providers: string[]; openSignup: boolean };
   env: {
+    agentRuntime: string;
     defaultProvider: string;
     defaultModel: string;
     deploymentModelKey?: string;
@@ -960,17 +964,32 @@ export function createRouter(deps: RouterDeps) {
         );
         await Promise.all(
           archived.computers.map(async (computer) => {
-            if (!computer.providerRef || !computer.executionBotId) return;
-            await deps.sandbox
-              .releaseScreen?.(toComputerRef(computer), {
-                operationId: "stop",
-                traceId: "stop",
-                spaceId: context.actor.spaceId,
-                userId: context.actor.userId,
-                botId: computer.executionBotId,
-                signal: new AbortController().signal,
-              })
-              .catch(() => undefined);
+            if (!computer.providerRef || !computer.executionBotId || !computer.executionRunId) {
+              return;
+            }
+            const adapterContext = {
+              operationId: "stop",
+              traceId: "stop",
+              spaceId: context.actor.spaceId,
+              userId: context.actor.userId,
+              botId: computer.executionBotId,
+              runId: computer.executionRunId,
+              screenLeaseId: screenLeaseIdForRun(
+                { runId: computer.executionRunId, fence: computer.executionFence },
+                computer.executionRunId,
+              ),
+              cancelRunWork: true,
+              signal: new AbortController().signal,
+            };
+            const ref = toComputerRef(computer);
+            await cancelComputerRunWork(
+              deps.sandbox,
+              ref,
+              computer.id,
+              computer.executionRunId,
+              adapterContext,
+            );
+            await deps.sandbox.releaseScreen?.(ref, adapterContext).catch(() => undefined);
           }),
         );
         return { ok: true as const };
@@ -1057,6 +1076,9 @@ export function createRouter(deps: RouterDeps) {
         }
       }),
       send: authed.threads.send.handler(async ({ context, input }) => {
+        if ((await modelSetup(deps, context.actor)).needsModel) {
+          throw new ORPCError("BAD_REQUEST", { message: "Connect a model to start a run." });
+        }
         const target = await resolveThreadTarget(deps.prisma, context.actor, input);
         if (target.kind === "bot") {
           await assertTeachingSendAllowed(deps.prisma, context.actor.spaceId, target.botId);
@@ -1456,17 +1478,8 @@ export function createRouter(deps: RouterDeps) {
         ) {
           throw new ORPCError("CONFLICT", { message: "Stop the bot first" });
         }
-        const executionLeaseActive = Boolean(
-          executionLease && executionLease.expiresAt.getTime() > Date.now(),
-        );
-        const executionRunActive = Boolean(
-          executionRun && ACTIVE_RUN_STATUSES.some((status) => status === executionRun.status),
-        );
-        if (executionLease && !executionLeaseActive && !executionRunActive) {
-          await deps.prisma.computerExecutionLease.deleteMany({
-            where: { id: executionLease.id },
-          });
-        }
+        // Keep an inactive lease as a fencing tombstone. The next run reclaims it
+        // with a higher fence, even if this user's screen remains connected.
 
         const leaseId = randomUUID();
         const expiresAt = new Date(Date.now() + takeoverLeaseMs());
@@ -1534,13 +1547,19 @@ export function createRouter(deps: RouterDeps) {
         if (!bot.computer) throw new IsolationError();
         const controlBotId = bot.computer.controlBotId;
         const controlLeaseId = bot.computer.controlLeaseId;
-        if (
-          !hasActiveComputerControl(bot.computer) ||
-          bot.computer.controlHolder !== "user" ||
-          !controlBotId ||
-          !controlLeaseId ||
-          controlBotId !== bot.id
-        ) {
+        if (bot.computer.controlHolder !== "user" || !controlBotId || controlBotId !== bot.id) {
+          return { ok: true as const };
+        }
+        if (!hasActiveComputerControl(bot.computer) || !controlLeaseId) {
+          // Stale controlHolder=user. Prefer expiry (revokes provider control). If a lease id
+          // remains after a failed revoke, keep it so reconciliation can retry.
+          if (controlLeaseId) {
+            await expireComputerControl(deps, bot.computer.id, controlLeaseId).catch(
+              () => undefined,
+            );
+          } else {
+            await clearInactiveUserComputerControl(deps.prisma, bot.computer.id);
+          }
           return { ok: true as const };
         }
         if (bot.computer.providerRef) {
@@ -1701,6 +1720,9 @@ export function createRouter(deps: RouterDeps) {
             await computerScreenContext(deps.prisma, context.actor, computer.id, bot.id, "screen"),
           )
           .catch(async (error: unknown) => {
+            if (isComputerScreenUnavailable(error)) {
+              throw new ORPCError("CONFLICT", { message: error.message });
+            }
             if (!isSandboxGoneError(error)) throw error;
             // The provider killed this sandbox (idle timeout) while the row still says
             // running. Clear the dead ref so the UI offers a boot instead of 500ing.
@@ -3648,27 +3670,40 @@ async function loadAutoReviewSettings(deps: RouterDeps, actor: Actor) {
 }
 
 async function meDto(deps: RouterDeps, actor: Actor): Promise<Me> {
-  const [user, cred, settings] = await Promise.all([
+  const [user, setup] = await Promise.all([
     deps.prisma.user.findUniqueOrThrow({ where: { id: actor.userId } }),
-    findDefaultModelCredential(deps.prisma, actor),
-    deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
+    modelSetup(deps, actor),
   ]);
-  const hasDeployment = Boolean(
-    settings?.deploymentModelCredentialCipher || deps.env.deploymentModelKey,
-  );
   return {
     userId: actor.userId,
     email: user.email,
     name: user.name,
     spaceId: actor.spaceId,
     isDeploymentOwner: actor.isDeploymentOwner,
-    needsModel: !cred && !hasDeployment,
-    defaultProvider: cred?.provider ?? settings?.defaultModelProvider ?? deps.env.defaultProvider,
-    defaultModel: cred?.defaultModel ?? settings?.defaultModelId ?? deps.env.defaultModel,
-    computerHost: computerHostFor(settings?.computerHost, deps.env.sandboxProvider),
+    needsModel: setup.needsModel,
+    defaultProvider:
+      setup.credential?.provider ??
+      setup.settings?.defaultModelProvider ??
+      deps.env.defaultProvider,
+    defaultModel:
+      setup.credential?.defaultModel ?? setup.settings?.defaultModelId ?? deps.env.defaultModel,
+    computerHost: computerHostFor(setup.settings?.computerHost, deps.env.sandboxProvider),
     canChooseHostComputer: actor.isDeploymentOwner && deps.env.sandboxProvider === "docker",
     sandboxProvider: deps.env.sandboxProvider,
     avatarStyle: user.avatarStyle === "organic" ? "organic" : "robot",
+  };
+}
+
+async function modelSetup(deps: RouterDeps, actor: Actor) {
+  const [credential, settings] = await Promise.all([
+    findDefaultModelCredential(deps.prisma, actor),
+    deps.prisma.deploymentSettings.findUnique({ where: { id: "default" } }),
+  ]);
+  const hasDeployment = Boolean(deps.env.deploymentModelKey);
+  return {
+    credential,
+    settings,
+    needsModel: deps.env.agentRuntime !== "scripted" && !credential && !hasDeployment,
   };
 }
 
@@ -3739,14 +3774,22 @@ async function runComputerReplace(
 async function expireStaleComputerControl(
   deps: RouterDeps,
   computer:
-    | (NonNullable<Parameters<typeof hasActiveComputerControl>[0]> & { id: string })
+    | (NonNullable<Parameters<typeof hasActiveComputerControl>[0]> & {
+        id: string;
+        controlHolder?: string;
+      })
     | null
     | undefined,
 ): Promise<boolean> {
-  const leaseId = computer?.controlLeaseId;
-  if (!leaseId || hasActiveComputerControl(computer)) return false;
-  await expireComputerControl(deps, computer.id, leaseId).catch(() => undefined);
-  return true;
+  if (!computer || hasActiveComputerControl(computer)) return false;
+  if (computer.controlHolder !== "user") return false;
+  const leaseId = computer.controlLeaseId;
+  // Keep a failed revoke's lease id so reconciliation can retry provider shutdown.
+  if (leaseId) {
+    await expireComputerControl(deps, computer.id, leaseId).catch(() => undefined);
+    return true;
+  }
+  return clearInactiveUserComputerControl(deps.prisma, computer.id).catch(() => false);
 }
 
 async function computerScreenContext(
