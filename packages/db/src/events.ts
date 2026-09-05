@@ -10,6 +10,7 @@ import {
   isSecretAskBlock,
   sanitizeJsonValue,
 } from "@rakazo/core";
+import { getLogger } from "@rakazo/logging";
 import type { Prisma, PrismaClient } from "./client.js";
 import { expireComputerExecutionLeases } from "./computers.js";
 import {
@@ -109,7 +110,11 @@ interface FinalizeRunBase {
 
 export type FinalizeRunInput = FinalizeRunBase &
   (
-    | { outcome: "completed"; blocks: MessageBlock[]; markUnread?: boolean }
+    | {
+        outcome: "completed";
+        blocks: MessageBlock[];
+        markUnread?: boolean;
+      }
     | { outcome: "failed"; error: string }
   );
 
@@ -444,7 +449,7 @@ export async function sendUserMessage(
   if ("replay" in committed) return committed.replay;
   await notifyRealtime(realtime, input.threadId, committed.event.seq).catch((error) => {
     // The event is durable; subscribers recover it from their persisted cursor.
-    console.error("user message realtime notification", error);
+    getLogger().error("user message realtime notification", error);
   });
   return {
     messageId: committed.message.id,
