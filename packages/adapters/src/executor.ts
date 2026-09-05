@@ -46,6 +46,7 @@ import {
   isMessagingChannelRun,
   isOneShotRoutineCrons,
   isTerminal,
+  messagingChannelId,
   messagingChannelPrivacyBlock,
   messagingDmSurfaceNote,
   nextCronDateAcross,
@@ -70,6 +71,7 @@ import {
   findDefaultModelCredential,
   findModelCredential,
   InvalidSpaceNameError,
+  loadRunHistoryMessages,
   type McpServer,
   type Prisma,
   type PrismaClient,
@@ -209,6 +211,7 @@ import {
   secretPausedToolResult,
   tryCompleteConnectionWithCode,
 } from "./run-secret.js";
+import { withRuntimeCleanup } from "./runtime-stream.js";
 import {
   cancelScheduleFromTool,
   createScheduleFromTool,
@@ -864,6 +867,17 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
       const runSecrets = [...deps.secrets];
       try {
+        const sourceBlocks =
+          run.trigger === "messaging" && run.sourceMessageId
+            ? ((
+                await deps.prisma.message.findUnique({
+                  where: { id: run.sourceMessageId },
+                  select: { blocks: true },
+                })
+              )?.blocks as MessageBlock[] | undefined)
+            : undefined;
+        const channelId = messagingChannelId(sourceBlocks);
+        const messagingChannelRun = isMessagingChannelRun(run.trigger, sourceBlocks);
         const [
           bot,
           thread,
@@ -882,12 +896,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             include: { computer: true },
           }),
           deps.prisma.thread.findUniqueOrThrow({ where: { id: run.threadId } }),
-          deps.prisma.message.findMany({
-            where: { threadId: run.threadId },
-            orderBy: { seq: "desc" },
-            take: LEGACY_HISTORY_WINDOW_SIZE,
-            select: { id: true, seq: true, role: true, runId: true, blocks: true },
-          }),
+          loadRunHistoryMessages(deps.prisma, run, LEGACY_HISTORY_WINDOW_SIZE, channelId),
           run.trigger === "bot_message"
             ? loadBotMessageContext(deps.prisma, run.sourceMessageId)
             : Promise.resolve(undefined),
@@ -982,19 +991,23 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const discoveredPromise = deps.connector
           ? deps.connector.discoverTools(context)
           : Promise.resolve([]);
-        const threadContext = threadContextForRun(run.trigger, {
-          messages: [...messages].reverse().map((m) => ({
-            id: m.id,
-            seq: m.seq,
-            role: (m.role === "user" ? "user" : m.role === "system" ? "system" : "assistant") as
-              | "user"
-              | "assistant"
-              | "system",
-            content: blocksToAgentHistoryText(m.blocks as MessageBlock[]),
-          })),
-          summary: thread.historyCompactionSummary,
-          historyCompactedUpToSeq: thread.historyCompactedUpToSeq,
-        });
+        const threadContext = threadContextForRun(
+          run.trigger,
+          {
+            messages: [...messages].reverse().map((m) => ({
+              id: m.id,
+              seq: m.seq,
+              role: (m.role === "user" ? "user" : m.role === "system" ? "system" : "assistant") as
+                | "user"
+                | "assistant"
+                | "system",
+              content: blocksToAgentHistoryText(m.blocks as MessageBlock[]),
+            })),
+            summary: thread.historyCompactionSummary,
+            historyCompactedUpToSeq: thread.historyCompactedUpToSeq,
+          },
+          messagingChannelRun,
+        );
         const compactedHistory = selectCompactedHistory({
           messages: threadContext.messages,
           summary: threadContext.summary,
@@ -1048,14 +1061,18 @@ export function createRunExecutor(deps: ExecutorDeps) {
           await Promise.all([
             discoveredPromise,
             loadCurrentTurnImages(deps, turnBlocks, context),
-            loadAgentMemoryContext(deps.memory, bot.id, context),
-            loadAgentScratchpadContext(deps, {
-              spaceId: run.spaceId,
-              botId: bot.id,
-            }),
+            messagingChannelRun
+              ? Promise.resolve("")
+              : loadAgentMemoryContext(deps.memory, bot.id, context),
+            messagingChannelRun
+              ? Promise.resolve("")
+              : loadAgentScratchpadContext(deps, {
+                  spaceId: run.spaceId,
+                  botId: bot.id,
+                }),
             recallPromise,
           ]);
-        const semanticMemoryEnabled = Boolean(semanticMemory);
+        const semanticMemoryEnabled = Boolean(semanticMemory) && !messagingChannelRun;
         let recalledMemory = "";
         let recallSucceeded = false;
         if (recalled) {
@@ -1180,17 +1197,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
         const groupContext = thread.groupId
           ? await loadGroupContext(deps.prisma, thread.groupId, { id: bot.id, name: bot.name })
           : undefined;
-        // Messaging runs are rare; the source lookup only happens for them.
-        const messagingSourceBlocks =
-          run.trigger === "messaging" && run.sourceMessageId
-            ? ((
-                await deps.prisma.message.findUnique({
-                  where: { id: run.sourceMessageId },
-                  select: { blocks: true },
-                })
-              )?.blocks as MessageBlock[] | undefined)
-            : undefined;
-        const messagingChannelRun = isMessagingChannelRun(run.trigger, messagingSourceBlocks);
         const hasMessagingIdentity = deps.messaging
           ? await deps.messaging.hasIdentity(bot.id)
           : false;
@@ -1206,6 +1212,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             groupId: thread.groupId,
             trigger: run.trigger,
             semanticMemoryEnabled,
+            messagingChannelRun,
           }),
           // Cross-owner agent connections only exist for chat-linked bots.
           ...(hasMessagingIdentity ? agentConnectionTools : []),
@@ -1220,9 +1227,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
         );
         const connectorSchemas = new Map(
           exposedConnectorTools.map((tool) => [tool.name, tool.inputSchema] as const),
-        );
-        const readOnlyConnectorTools = new Set(
-          exposedConnectorTools.filter((tool) => tool.readOnly).map((tool) => tool.name),
         );
         let approvalRulesPromise: Promise<ActionApprovalRule[]> | undefined;
         const loadApprovalRules = () => {
@@ -1390,6 +1394,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           args: Record<string, unknown>,
           executionId: string,
         ) => {
+          context.signal.throwIfAborted();
           if (handedOff) {
             return { error: "This stage was handed off. End the turn without more tool calls." };
           }
@@ -1418,7 +1423,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
           let catalogRemapped = false;
           let resolvedToolSchema: Record<string, unknown> | undefined;
           let effectRequest: unknown = args;
-          let connectorReadOnly = readOnlyConnectorTools.has(name);
           if (connectorCall.route && deps.connector?.resolveCall) {
             try {
               const resolved = await deps.connector.resolveCall(connectorCall, context);
@@ -1446,7 +1450,6 @@ export function createRunExecutor(deps: ExecutorDeps) {
                     : undefined,
                 );
                 connectorCall = resolved.call;
-                connectorReadOnly = resolved.tool.readOnly === true;
               }
             } catch (error) {
               return { error: sanitizeConnectorError(error) };
@@ -1608,14 +1611,18 @@ export function createRunExecutor(deps: ExecutorDeps) {
           let reviewReason: string | undefined;
           let gateDecision: "ask" | "allow" = plan === "ask" ? "ask" : "allow";
           const needsApprovalEarly = plan === "ask" || plan === "judge";
+          // A resumed approval keeps its key even if "Always allow" changed the policy.
           const effectKey =
-            name === "request_secret" || needsApprovalEarly || requiresApprovalByDefault
+            nextApprovedTool ||
+            name === "request_secret" ||
+            needsApprovalEarly ||
+            requiresApprovalByDefault
               ? approvalEffectKey(runId, replayEffectToolName, args)
               : executionId;
-          const applied =
-            READ_ONLY_AGENT_TOOLS.has(name) || connectorReadOnly
-              ? undefined
-              : await recordEffect(deps, run, replayEffectToolName, effectKey, effectRequest);
+          // Connector read-only hints must not bypass approval, review, or replay decisions.
+          const applied = READ_ONLY_AGENT_TOOLS.has(name)
+            ? undefined
+            : await recordEffect(deps, run, replayEffectToolName, effectKey, effectRequest);
 
           const runAutoReview = async () => {
             if (!checker) return;
@@ -2930,7 +2937,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             );
 
         try {
-          for await (const event of deps.runtime.run(
+          const runtimeEvents = deps.runtime.run(
             {
               botId: bot.id,
               threadId: thread.id,
@@ -3037,7 +3044,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
                   },
             },
             context,
-          )) {
+          );
+          for await (const event of withRuntimeCleanup(runtimeEvents, runAbortController)) {
             if (approvalPausePending) return;
             if (!leaseValid) return;
             const now = Date.now();
@@ -3160,19 +3168,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 pendingProgress = "";
               }
               await publishMessage(deps, run, "bot", [
-                { kind: "computer", state: "Ready", text: safeReason },
+                { kind: "computer", state: "Needs you", text: safeReason },
               ]);
-              await deps.prisma.computer.updateMany({
-                where: { id: storedComputer.id },
-                data: {
-                  state: "running",
-                  controlHolder: "none",
-                  controlLeaseId: null,
-                  controlLeaseExpiresAt: null,
-                  controlBotId: null,
-                  controlRunId: null,
-                },
-              });
               await workspaceCheckpoint.flush();
               if (!(await holdComputerExecutionLeaseForTakeover(deps.prisma, computerLease))) {
                 throw new Error("Computer lease expired before takeover");
@@ -3186,6 +3183,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 leaseOwner: workerId,
                 leaseFence: fence,
                 reason: safeReason,
+                computerId: storedComputer.id,
               });
               if (!paused) return;
               retainComputerLease = true;
@@ -3329,7 +3327,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
             }
           }
 
-          if (approvalPausePending) return;
+          if (approvalPausePending || !leaseValid) return;
           approvedEffectReplays.assertDrained();
           pendingProgress += progressRedactor.finish();
           await flushProgress();
@@ -3652,6 +3650,7 @@ export function selectBuiltinToolsForRun(options: {
   groupId: string | null;
   trigger: string;
   semanticMemoryEnabled: boolean;
+  messagingChannelRun: boolean;
 }) {
   return selectMemoryTools(
     filterBuiltinToolsForRun(
@@ -3662,6 +3661,11 @@ export function selectBuiltinToolsForRun(options: {
       options.trigger,
     ),
     options.semanticMemoryEnabled,
+  ).filter(
+    (tool) =>
+      !options.messagingChannelRun ||
+      (!["remember", "save_memory", "recall_memory"].includes(tool.name) &&
+        !tool.name.startsWith("scratchpad_")),
   );
 }
 
@@ -3672,6 +3676,7 @@ export function threadContextForRun<T>(
     summary: string | null;
     historyCompactedUpToSeq: number | null;
   },
+  messagingChannelRun: boolean,
 ) {
   return trigger === "routine"
     ? {
@@ -3680,7 +3685,9 @@ export function threadContextForRun<T>(
         historyCompactedUpToSeq: null,
         includeSemanticRecall: false,
       }
-    : { ...context, includeSemanticRecall: true };
+    : messagingChannelRun
+      ? { ...context, summary: null, historyCompactedUpToSeq: null, includeSemanticRecall: false }
+      : { ...context, includeSemanticRecall: true };
 }
 
 export function completionMessageSegments(
