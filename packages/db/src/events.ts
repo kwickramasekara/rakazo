@@ -1,5 +1,6 @@
 import type { RealtimeFanout } from "@rakazo/adapter-kit";
 import {
+  type BotSecretDestination,
   type MessageBlock,
   MessageBlock as MessageBlockSchema,
   type ProductEvent,
@@ -12,6 +13,7 @@ import {
   sanitizeJsonValue,
 } from "@rakazo/core";
 import { getLogger } from "@rakazo/logging";
+import { cancelRunsInTransaction } from "./cancel-runs.js";
 import type { Prisma, PrismaClient } from "./client.js";
 import { expireComputerExecutionLeases } from "./computers.js";
 import {
@@ -195,6 +197,10 @@ export interface SendUserMessageInput {
   trigger: "user" | "follow_up" | "webhook" | "messaging";
   clientNonce?: string;
   linkMessageToRun?: boolean;
+  /** When false, persist the user message without starting a run (team-chat transcript). */
+  createRun?: boolean;
+  /** When true, start a new run even if the bot is already busy (team-chat delivery). */
+  allowParallelRun?: boolean;
 }
 
 export interface SendUserMessageResult {
@@ -206,6 +212,8 @@ export interface SendUserMessageResult {
 
 export interface RunSecretWriter {
   store(input: {
+    botId: string;
+    credential?: BotSecretDestination;
     runId: string;
     userId: string;
     spaceId: string;
@@ -262,26 +270,7 @@ export async function clearThread(
     });
     const now = new Date();
     const runIds = activeRuns.map((run) => run.id);
-    const taskIds = activeRuns.map((run) => run.taskId);
-    if (runIds.length > 0) {
-      await tx.run.updateMany({
-        where: { id: { in: runIds } },
-        data: {
-          status: "cancelled",
-          completedAt: now,
-          leaseOwner: null,
-          leaseExpiresAt: null,
-        },
-      });
-      await tx.attempt.updateMany({
-        where: { runId: { in: runIds }, status: "running" },
-        data: { status: "cancelled", finishedAt: now },
-      });
-      await tx.task.updateMany({
-        where: { id: { in: taskIds } },
-        data: { status: "cancelled" },
-      });
-    }
+    await cancelRunsInTransaction(tx, activeRuns, now);
     // Expire as tombstones so a still-open provider screen claim cannot reset fencing to 1.
     await expireComputerExecutionLeases(tx, { runId: { in: runIds } });
     await tx.computer.updateMany({
@@ -386,17 +375,23 @@ export async function sendUserMessage(
         blocks: input.blocks,
         clientNonce: input.clientNonce,
       });
-      const busy = await tx.run.findFirst({
-        where: {
-          threadId: input.threadId,
-          botId: input.botId,
-          status: { in: ["running", "queued", "leased", "waiting_input", "waiting_takeover"] },
-        },
-        select: { id: true, taskId: true },
-      });
+      const createRun = input.createRun !== false;
+      const busy =
+        createRun && !input.allowParallelRun
+          ? await tx.run.findFirst({
+              where: {
+                threadId: input.threadId,
+                botId: input.botId,
+                status: {
+                  in: ["running", "queued", "leased", "waiting_input", "waiting_takeover"],
+                },
+              },
+              select: { id: true, taskId: true },
+            })
+          : null;
       let task = null;
       let run = null;
-      if (!busy) {
+      if (createRun && !busy) {
         task = await tx.task.create({
           data: {
             spaceId: input.spaceId,
@@ -423,7 +418,7 @@ export async function sendUserMessage(
         if (input.linkMessageToRun) {
           await tx.message.update({ where: { id: message.id }, data: { runId: run.id } });
         }
-      } else {
+      } else if (createRun && busy) {
         await tx.steeringMessage.create({
           data: {
             messageId: message.id,
@@ -556,6 +551,7 @@ export async function answerRunInput(
       : undefined;
     if (choiceAsk && !selectedChoice) return null;
     if (secretAsk && !runSecretWriter) return null;
+    if (secretAsk && pendingAsk.credential && run.userId !== input.answeredByUserId) return null;
     let approvalEffect: { id: string; kind: string } | null = null;
     let approvalUserId: string | null = null;
 
@@ -619,6 +615,8 @@ export async function answerRunInput(
       }
     } else if (secretAsk) {
       await runSecretWriter!.store({
+        botId: run.botId,
+        credential: pendingAsk.credential,
         runId: input.runId,
         userId: run.userId,
         spaceId: input.spaceId,
@@ -632,7 +630,10 @@ export async function answerRunInput(
           kind: "request_secret",
           status: "intended",
         },
-        data: { status: "approved" },
+        data: {
+          status: "approved",
+          ...(pendingAsk.credential ? { result: { credentialSaved: pendingAsk.credential } } : {}),
+        },
       });
     } else {
       const resumeLabel = selectedChoice

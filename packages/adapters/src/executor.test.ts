@@ -3,6 +3,7 @@ import { ONCE_ROUTINE_CRON } from "@rakazo/core";
 import type { PrismaClient } from "@rakazo/db";
 import { describe, expect, it, vi } from "vitest";
 import {
+  appendToolCompletionAudit,
   createRunExecutor,
   createRunWorkspaceCheckpoint,
   loadCurrentTurnImages,
@@ -11,7 +12,94 @@ import {
   selectBuiltinToolsForRun,
   settleSteeringAttachmentLoads,
   threadContextForRun,
+  toolCompletionAuditPayload,
+  toolCompletionFromResult,
 } from "./executor.js";
+
+describe("tool completion audit", () => {
+  it("records result metadata without persisting tool contents", () => {
+    const payload = toolCompletionAuditPayload({
+      name: "computer_observe",
+      executionId: "call-1",
+      durationMs: 12.6,
+      result: {
+        kind: "agent_tool_result",
+        content: [
+          { type: "text", text: "Visible window" },
+          { type: "image", data: "image-bytes", mimeType: "image/png" },
+        ],
+        details: {
+          frameId: "frame-1",
+          capturedAt: "2026-09-07T00:00:00.000Z",
+          width: 1280,
+          height: 720,
+          activeWindow: { title: "Private window" },
+        },
+      },
+    });
+
+    expect(payload).toEqual({
+      name: "computer_observe",
+      executionId: "call-1",
+      durationMs: 13,
+      outcome: "succeeded",
+      contentTypes: ["text", "image"],
+      frameId: "frame-1",
+      capturedAt: "2026-09-07T00:00:00.000Z",
+      width: 1280,
+      height: 720,
+    });
+    expect(payload).not.toHaveProperty("content");
+    expect(payload).not.toHaveProperty("activeWindow");
+  });
+
+  it("does not fail the run when the audit append fails", async () => {
+    const append = vi.fn().mockRejectedValue(new Error("database unavailable"));
+
+    await expect(
+      appendToolCompletionAudit(
+        { events: { append } },
+        { spaceId: "space-1", threadId: "thread-1", botId: "bot-1", runId: "run-1" },
+        {
+          name: "destination.write",
+          executionId: "call-1",
+          durationMs: 4,
+          error: new Error("Bearer secret-token"),
+        },
+        ["secret-token"],
+      ),
+    ).resolves.toBeUndefined();
+    expect(append).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "agent.tool.completed",
+        payload: expect.objectContaining({
+          outcome: "error",
+          error: "Bearer [redacted]",
+        }),
+      }),
+    );
+  });
+
+  it("records rejected scripted tool results as errors", () => {
+    const completion = toolCompletionFromResult(
+      { name: "destination.write", executionId: "call-1", durationMs: 4 },
+      { error: "destination rejected the record" },
+    );
+
+    expect(completion).toEqual({
+      name: "destination.write",
+      executionId: "call-1",
+      durationMs: 4,
+      error: "destination rejected the record",
+      paused: false,
+    });
+    expect(toolCompletionAuditPayload(completion)).toMatchObject({
+      outcome: "error",
+      error: "destination rejected the record",
+    });
+    expect(completion).not.toHaveProperty("result");
+  });
+});
 
 describe("run workspace checkpoint", () => {
   it("skips clean turns and flushes once after a mutation", async () => {
@@ -50,14 +138,59 @@ describe("run workspace checkpoint", () => {
 });
 
 describe("run tool selection", () => {
-  const toolNames = (trigger: string, groupId: string | null = null) =>
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])("gates page browsers (%s) independently of cloud agents (%s)", (page, cloud) => {
+    const names = selectBuiltinToolsForRun({
+      graphicalToolsAllowed: false,
+      pageBrowserAllowed: page,
+      cloudAgentEnabled: cloud,
+      groupId: null,
+      trigger: "message",
+      semanticMemoryEnabled: false,
+      messagingChannelRun: false,
+    }).map((tool) => tool.name);
+    expect(names.includes("browser_snapshot")).toBe(page);
+    expect(names.includes("cloud_agent_status")).toBe(cloud);
+    expect(names).not.toContain("computer_act");
+  });
+
+  const toolNames = (
+    trigger: string,
+    groupId: string | null = null,
+    options?: { graphicalToolsAllowed?: boolean; pageBrowserAllowed?: boolean },
+  ) =>
     selectBuiltinToolsForRun({
-      graphicalToolsAllowed: true,
+      graphicalToolsAllowed: options?.graphicalToolsAllowed ?? true,
+      pageBrowserAllowed: options?.pageBrowserAllowed ?? true,
       groupId,
       trigger,
       semanticMemoryEnabled: false,
       messagingChannelRun: false,
     }).map((tool) => tool.name);
+
+  it("keeps page browser tools without vision, and hides them without a graphical computer", () => {
+    const withPage = toolNames("message", null, {
+      graphicalToolsAllowed: false,
+      pageBrowserAllowed: true,
+    });
+    expect(withPage).toEqual(
+      expect.arrayContaining(["browser_navigate", "browser_snapshot", "browser_act"]),
+    );
+    expect(withPage).not.toEqual(expect.arrayContaining(["computer_observe", "computer_act"]));
+
+    const withoutPage = toolNames("message", null, {
+      graphicalToolsAllowed: true,
+      pageBrowserAllowed: false,
+    });
+    expect(withoutPage).not.toEqual(
+      expect.arrayContaining(["browser_navigate", "browser_snapshot", "browser_act"]),
+    );
+    expect(withoutPage).toEqual(expect.arrayContaining(["computer_observe", "computer_act"]));
+  });
 
   it("withholds schedule creation only from routine-triggered runs", () => {
     expect(toolNames("routine")).not.toContain("schedule_create");
@@ -907,6 +1040,7 @@ description: Prepare standup notes
       userModelCredential: { findFirst: vi.fn(async () => null) },
       deploymentSettings: { findUnique: vi.fn(async () => null) },
       taughtSkill: { findMany: vi.fn(async () => []) },
+      agentSecret: { findMany: vi.fn(async () => []) },
       agentSkill: { findMany: vi.fn(async () => []) },
       scratchpadItem: { findMany: vi.fn(async () => []) },
     } as unknown as PrismaClient;

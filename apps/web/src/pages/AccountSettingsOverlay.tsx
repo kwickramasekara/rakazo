@@ -26,6 +26,7 @@ import {
   ComputersUnavailableHint,
   computersAreUnavailable,
 } from "../components/ComputersUnavailableHint";
+import { DesktopUpdateSection } from "../components/DesktopUpdates";
 import { SoftwareUpdateSection } from "../components/SoftwareUpdateSection";
 import { authClient } from "../lib/auth";
 import { getActiveUiLocale, setUiLocale } from "../lib/i18n";
@@ -129,7 +130,7 @@ export function AccountSettingsOverlay({
           {email ? <p className="mt-1 text-[13px] text-muted-foreground/70">{email}</p> : null}
         </section>
 
-        <ChangePasswordSection />
+        <ChangePasswordSection email={email} />
 
         {messagingEnabled && onOpenMessaging ? (
           <section className="mt-5 rounded-xl border border-border px-4 py-4">
@@ -217,6 +218,7 @@ export function AccountSettingsOverlay({
           </p>
         </div>
 
+        <DesktopUpdateSection />
         <SoftwareUpdateSection isDeploymentOwner={isDeploymentOwner} />
 
         {isDeploymentOwner && computersAreUnavailable(sandboxProvider) ? (
@@ -257,7 +259,7 @@ export function AccountSettingsOverlay({
   );
 }
 
-function ChangePasswordSection() {
+function ChangePasswordSection({ email }: { email?: string | null }) {
   const { t } = useLingui();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -302,6 +304,16 @@ function ChangePasswordSection() {
         <Trans>Password</Trans>
       </h3>
       <div className="mt-3 grid gap-3">
+        <input
+          type="text"
+          name="username"
+          autoComplete="username"
+          value={email ?? ""}
+          readOnly
+          tabIndex={-1}
+          aria-hidden="true"
+          className="sr-only"
+        />
         <SettingsPasswordInput
           label={t`Current password`}
           autoComplete="current-password"
