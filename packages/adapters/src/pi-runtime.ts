@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   Agent,
   type AgentMessage,
@@ -27,6 +28,7 @@ import type {
 import { getLogger } from "@rakazo/logging";
 import { isToolPauseResult } from "./approval-effect.js";
 import { builtinAgentTools, DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
+import { DEFAULT_OPENROUTER_MODEL_ID } from "./deployment-model.js";
 import { PiRuntimeCredentialStore, toOAuthCredential } from "./pi-credentials.js";
 import { registerLocalProvider } from "./pi-local-provider.js";
 import {
@@ -152,41 +154,16 @@ export class PiAgentRuntime implements AgentRuntime {
 
     const work = (async () => {
       try {
-        const provider =
-          request.model.provider === "scripted" ? "openrouter" : request.model.provider;
-        const envDefaultModel = process.env.PI_DEFAULT_MODEL?.trim();
-        const envDefaultProvider = process.env.PI_DEFAULT_PROVIDER?.trim() || "openrouter";
-        const modelId =
-          request.model.id === "scripted"
-            ? envDefaultModel || "deepseek/deepseek-v4-flash-0731"
-            : request.model.id.trim();
-        const models = modelsForRequest(request, provider);
-        let model = models.getModel(provider, modelId);
-        if (!model && provider !== "openrouter" && provider !== OPENAI_COMPATIBLE_PROVIDER_ID) {
-          model = models.getModel("openrouter", modelId);
-        }
-        if (
-          !model &&
-          provider === "openrouter" &&
-          envDefaultProvider === "openrouter" &&
-          modelId === envDefaultModel
-        ) {
-          model = configuredOpenRouterModel(modelId);
-        }
-        if (!model) {
-          queue.push({ type: "text", text: `Unknown model ${provider}/${modelId}` });
+        const selectedModel = resolveRuntimeModel(request.model);
+        if (!selectedModel.model) {
+          queue.push({
+            type: "text",
+            text: `Unknown model ${selectedModel.provider}/${selectedModel.modelId}`,
+          });
           queue.push({ type: "done" });
           return;
         }
-
-        const apiKey = request.model.oauth
-          ? undefined
-          : request.model.provider === OPENAI_COMPATIBLE_PROVIDER_ID
-            ? request.model.apiKey || "local"
-            : // Only OpenRouter may fall back to the OpenRouter env key. Handing it to
-              // another provider would ship our key to a vendor it was not issued for.
-              (request.model.apiKey ??
-              (provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined));
+        const { models, model, apiKey } = selectedModel;
         const toolDefs = request.tools.length ? request.tools : builtinAgentTools;
         const nestedAgents = new Set<Agent>();
         const host: ToolHost = {
@@ -251,7 +228,7 @@ export class PiAgentRuntime implements AgentRuntime {
 
         let agent: Agent;
         agent = new Agent({
-          sessionId: `${request.threadId}:${request.botId}`,
+          sessionId: conversationSessionId(request.threadId, request.botId),
           steeringMode: "all",
           streamFn: (m, ctx, options) =>
             models.streamSimple(m, ctx, reliableStreamOptions(m, options)),
@@ -398,7 +375,7 @@ export class PiAgentRuntime implements AgentRuntime {
         const budgetExceeded = host.toolCallBudget.exceeded;
         const error = agent.state.errorMessage;
         if (error && !budgetExceeded) {
-          throw new Error(sanitizeError(error));
+          throw new Error(sanitizeProviderError(model.provider, error));
         }
         if (budgetExceeded) {
           const budgetMessage = toolCallBudgetExceededMessage(host.toolCallBudget.limit);
@@ -477,6 +454,44 @@ function configuredOpenRouterModel(id: string): Model<"openai-completions"> {
     contextWindow: 16_384,
     maxTokens: 4_096,
   };
+}
+
+function resolveRuntimeModel(modelConfig: AgentRunRequest["model"]): {
+  provider: string;
+  modelId: string;
+  models: Models;
+  model: Model<Api> | undefined;
+  apiKey: string | undefined;
+} {
+  const provider = modelConfig.provider === "scripted" ? "openrouter" : modelConfig.provider;
+  const envDefaultModel = process.env.PI_DEFAULT_MODEL?.trim();
+  const envDefaultProvider = process.env.PI_DEFAULT_PROVIDER?.trim() || "openrouter";
+  const modelId =
+    modelConfig.id === "scripted"
+      ? envDefaultModel || DEFAULT_OPENROUTER_MODEL_ID
+      : modelConfig.id.trim();
+  const models = modelsForRequest({ model: modelConfig }, provider);
+  let model = models.getModel(provider, modelId);
+  if (!model && provider !== "openrouter" && provider !== OPENAI_COMPATIBLE_PROVIDER_ID) {
+    model = models.getModel("openrouter", modelId);
+  }
+  if (
+    !model &&
+    provider === "openrouter" &&
+    envDefaultProvider === "openrouter" &&
+    modelId === envDefaultModel
+  ) {
+    model = configuredOpenRouterModel(modelId);
+  }
+  const apiKey = modelConfig.oauth
+    ? undefined
+    : modelConfig.provider === OPENAI_COMPATIBLE_PROVIDER_ID
+      ? modelConfig.apiKey || "local"
+      : // Only OpenRouter may fall back to the OpenRouter env key. Handing it to
+        // another provider would ship our key to a vendor it was not issued for.
+        (modelConfig.apiKey ??
+        (provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined));
+  return { provider, modelId, models, model, apiKey };
 }
 
 export function modelsForRequest(
@@ -742,7 +757,8 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
       if (tool.name === "shell") {
         return {
           command: String(raw.command ?? ""),
-          cwd: raw.cwd ? String(raw.cwd) : "/home/rakazo",
+          // The executor chooses the bot-scoped default, including Team workspaces.
+          ...(raw.cwd ? { cwd: String(raw.cwd) } : {}),
         };
       }
       if (tool.name === "run_subagent") {
@@ -750,6 +766,8 @@ function toAgentTool(tool: ConnectorTool, host: ToolHost, exposedName: string): 
           name: String(raw.name ?? "helper"),
           task: String(raw.task ?? ""),
           instructions: raw.instructions ? String(raw.instructions) : "",
+          model_provider: raw.model_provider ? String(raw.model_provider) : "",
+          model_id: raw.model_id ? String(raw.model_id) : "",
         };
       }
       if (tool.name === "spawn_bot") {
@@ -908,14 +926,50 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
     progress: "starting…",
   });
 
+  const requestedProvider = String(args.model_provider ?? "").trim();
+  const requestedModelId = String(args.model_id ?? "").trim();
+  let requestModel = host.request.model;
+  try {
+    if (Boolean(requestedProvider) !== Boolean(requestedModelId)) {
+      throw new Error("model_provider and model_id must both be set");
+    }
+    if (requestedProvider && requestedModelId) {
+      if (!host.request.resolveModel) {
+        throw new Error("Per-call subagent model selection is unavailable");
+      }
+      requestModel = await host.request.resolveModel(requestedProvider, requestedModelId);
+    }
+  } catch (error) {
+    const message = sanitizeError(error instanceof Error ? error.message : String(error));
+    host.queue.push({ type: "subagent", agentId, name, task, status: "failed", result: message });
+    host.subagentGate.release();
+    return `Subagent failed: ${message}`;
+  }
+
+  const selectedModel = resolveRuntimeModel(requestModel);
+  if (!selectedModel.model) {
+    const message = `Unknown model ${selectedModel.provider}/${selectedModel.modelId}`;
+    host.queue.push({ type: "subagent", agentId, name, task, status: "failed", result: message });
+    host.subagentGate.release();
+    return `Subagent failed: ${message}`;
+  }
+  const subagentModel = selectedModel.model;
+
   const childDefs = (host.request.tools.length ? host.request.tools : builtinAgentTools).filter(
     (tool) => !DELEGATION_TOOL_NAMES.has(tool.name),
   );
-  const nestedHost: ToolHost = { ...host, depth: 1 };
+  const nestedHost: ToolHost = {
+    ...host,
+    models: selectedModel.models,
+    model: subagentModel,
+    apiKey: selectedModel.apiKey,
+    depth: 1,
+  };
   const nested = new Agent({
+    sessionId: conversationSessionId(host.request.threadId, host.request.botId, agentId),
     streamFn: (m, ctx, options) =>
-      host.models.streamSimple(m, ctx, reliableStreamOptions(m, options)),
-    getApiKey: async () => host.apiKey,
+      selectedModel.models.streamSimple(m, ctx, reliableStreamOptions(m, options)),
+    getApiKey: async () => selectedModel.apiKey,
     transformContext: async (messages) => pruneComputerScreenshotContext(messages),
     initialState: {
       systemPrompt: [
@@ -926,8 +980,8 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
       ]
         .filter(Boolean)
         .join(" "),
-      model: host.model,
-      thinkingLevel: thinkingLevelFor(host.model, host.request.model.thinkingLevel),
+      model: subagentModel,
+      thinkingLevel: thinkingLevelFor(subagentModel, requestModel.thinkingLevel),
       tools: toAgentTools(childDefs, nestedHost),
       messages: [],
     },
@@ -975,8 +1029,8 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
           type: "usage",
           inputTokens: event.message.usage.input ?? 0,
           outputTokens: event.message.usage.output ?? 0,
-          provider: host.model.provider,
-          model: host.model.id,
+          provider: subagentModel.provider,
+          model: subagentModel.id,
         });
       }
     }
@@ -1010,7 +1064,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
     const budgetExceeded = host.toolCallBudget.exceeded;
     const error = nested.state.errorMessage;
     if (error && !budgetExceeded) {
-      const message = sanitizeError(error);
+      const message = sanitizeProviderError(subagentModel.provider, error);
       host.queue.push({ type: "subagent", agentId, name, task, status: "failed", result: message });
       return `Subagent failed: ${message}`;
     }
@@ -1101,6 +1155,8 @@ function builtinParameters(tool: ConnectorTool) {
       name: Type.String(),
       task: Type.String(),
       instructions: Type.Optional(Type.String()),
+      model_provider: Type.Optional(Type.String()),
+      model_id: Type.Optional(Type.String()),
     });
   }
   if (tool.name === "spawn_bot") {
@@ -1293,6 +1349,33 @@ function sanitizeError(message: string) {
   return sanitizeSensitiveText(message);
 }
 
+/** Stable OpenCode affinity id for a bot conversation (and optional nested agent). */
+export function conversationSessionId(threadId: string, botId: string, agentId?: string): string {
+  return agentId ? `${threadId}:${botId}:${agentId}` : `${threadId}:${botId}`;
+}
+
+export function isOpenCodeProvider(provider: string): boolean {
+  return provider === "opencode" || provider === "opencode-go";
+}
+
+const OPENCODE_SESSION_ERROR = "OpenCode rejected this chat session. Send the message again.";
+
+function looksLikeOpenCodeSessionError(message: string): boolean {
+  return (
+    /x-opencode-session/i.test(message) ||
+    /session\s*(id|header|required|missing|invalid|expired|stale)/i.test(message) ||
+    /model is unavailable/i.test(message)
+  );
+}
+
+function sanitizeProviderError(provider: string, message: string): string {
+  const sanitized = sanitizeError(message);
+  if (isOpenCodeProvider(provider) && looksLikeOpenCodeSessionError(sanitized)) {
+    return OPENCODE_SESSION_ERROR;
+  }
+  return sanitized;
+}
+
 interface EventQueue {
   push(event: AgentRuntimeEvent): void;
   fail(error: Error): void;
@@ -1395,11 +1478,29 @@ export function reliableStreamOptions(
   model: Pick<Model<Api>, "api" | "provider">,
   options?: SimpleStreamOptions,
 ): SimpleStreamOptions | undefined {
-  if (model.provider !== "openai-codex" && model.api !== "openai-codex-responses") {
-    return options;
+  let next = options;
+
+  if (model.provider === "openai-codex" || model.api === "openai-codex-responses") {
+    // Pi cannot fall back after a WebSocket has emitted its start event. Long tool
+    // runs then surface abnormal close 1006 as a terminal model error. SSE has
+    // bounded network retries and no long-lived connection between tool turns.
+    next = { ...next, transport: "sse" };
   }
-  // Pi cannot fall back after a WebSocket has emitted its start event. Long tool
-  // runs then surface abnormal close 1006 as a terminal model error. SSE has
-  // bounded network retries and no long-lived connection between tool turns.
-  return { ...options, transport: "sse" };
+
+  // OpenCode Go/Zen require a sticky x-opencode-session header (affinity + some
+  // models 400 without it). Pi 0.85.1 does not attach that header on its own.
+  if (isOpenCodeProvider(model.provider)) {
+    const sessionId = next?.sessionId?.trim() || randomUUID();
+    next = {
+      ...next,
+      sessionId,
+      headers: {
+        "x-opencode-session": sessionId,
+        "x-opencode-client": "rakazo",
+        ...next?.headers,
+      },
+    };
+  }
+
+  return next;
 }

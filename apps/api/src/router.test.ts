@@ -1,6 +1,7 @@
 import { RPCHandler } from "@orpc/server/fetch";
 import { COMPUTER_SCREEN_UNAVAILABLE, ComputerScreenUnavailableError } from "@rakazo/adapters";
 import type { Actor } from "@rakazo/contracts";
+import { openScreenCapability } from "@rakazo/core/node/screen-capability";
 import type { PrismaClient } from "@rakazo/db";
 import { createLogger, createTestSink, installLogger } from "@rakazo/logging";
 import { describe, expect, it, vi } from "vitest";
@@ -40,6 +41,31 @@ describe("account preferences", () => {
     } satisfies Actor;
     return { update, deps, actor, handler: new RPCHandler(createRouter(deps)) };
   }
+
+  it("keeps an unconfigured catalog offline unless explicitly requested", async () => {
+    const { actor, deps } = preferencesDeps("robot");
+    const fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ results: [] }), {
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    deps.remoteConnectors = { fetch } as RouterDeps["remoteConnectors"];
+    const handler = new RPCHandler(createRouter(deps));
+    const request = async (usePublicCatalog?: boolean) =>
+      handler.handle(
+        new Request("http://127.0.0.1/rpc/capabilities/catalogSearch", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ json: { query: "notion", usePublicCatalog } }),
+        }),
+        { prefix: "/rpc", context: { actor } },
+      );
+    const { response } = await request();
+    await expect(response.json()).resolves.toEqual({ json: { enabled: false, results: [] } });
+    expect(fetch).not.toHaveBeenCalled();
+    await request(true);
+    expect(fetch).toHaveBeenCalled();
+  });
 
   it("persists and returns the selected avatar style", async () => {
     const { update, actor, handler } = preferencesDeps("organic");
@@ -545,6 +571,7 @@ describe("computer screen url", () => {
   } satisfies Actor;
   const computerRow = {
     id: "computer-1",
+    screenGeneration: 3,
     kind: "e2b",
     scope: "team",
     state: "running",
@@ -562,6 +589,7 @@ describe("computer screen url", () => {
       bot: {
         findFirst: vi.fn().mockResolvedValue({
           id: "bot-1",
+          screenGeneration: 2,
           thread: { id: "thread-1" },
           computer: computerRow,
         }),
@@ -593,6 +621,36 @@ describe("computer screen url", () => {
     );
     return { response, updateMany };
   };
+
+  it("issues lifecycle-bound capabilities for managed-provider screens too", async () => {
+    const { response } = await callScreenUrl(async () => ({
+      url: "https://screen.example/vnc.html?token=fake-token",
+    }));
+    expect(response.status).toBe(200);
+    const { json } = await response.json();
+    const url = new URL(json.url);
+    expect(url.origin).toBe("http://127.0.0.1:5173");
+    expect(openScreenCapability(url.pathname, "fake-test-secret")).toMatchObject({
+      scope: {
+        botId: "bot-1",
+        computerId: "computer-1",
+        botGeneration: 2,
+        computerGeneration: 3,
+        controlLeaseId: null,
+      },
+      target: { hostname: "screen.example", interactive: false },
+    });
+  });
+
+  it("returns desktop provider screen URLs without sealing them", async () => {
+    const { response } = await callScreenUrl(async () => ({
+      url: "desktop://screen/computer-1",
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      json: { url: "desktop://screen/computer-1?view_only=true" },
+    });
+  });
 
   it("clears the row instead of 500ing when the provider says the sandbox is gone", async () => {
     const { response, updateMany } = await callScreenUrl(() =>
@@ -630,5 +688,155 @@ describe("computer screen url", () => {
       }),
     });
     expect(updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("integration setup authorization", () => {
+  it.each([
+    { owner: false, configured: false, needsSetup: false },
+    { owner: true, configured: false, needsSetup: true },
+    { owner: true, configured: true, needsSetup: false },
+  ])(
+    "offers server setup only to an owner without configured providers: %j",
+    async ({ owner, configured, needsSetup }) => {
+      const lookup = vi.fn(async () => configured);
+      const deps = {
+        prisma: {},
+        env: { webOrigin: "https://example.test" },
+        integrationSettings: { configured: lookup },
+      } as unknown as RouterDeps;
+      const handler = new RPCHandler(createRouter(deps));
+      const { response } = await handler.handle(
+        new Request("https://example.test/rpc/integrationSetup/get", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ json: null }),
+        }),
+        {
+          prefix: "/rpc",
+          context: {
+            actor: {
+              userId: "user",
+              spaceId: "space",
+              email: "user@rakazo.test",
+              isDeploymentOwner: owner,
+            },
+          },
+        },
+      );
+      const result = (await response.json()).json;
+      expect(result).toMatchObject({ canConfigure: owner, needsSetup });
+      if (!owner) {
+        expect(result.providers).toEqual([]);
+        expect(lookup).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("rejects provider credentials from a non-owner before verification or persistence", async () => {
+    const save = vi.fn();
+    const deps = {
+      prisma: {},
+      env: { webOrigin: "https://example.test" },
+      integrationSettings: { save },
+    } as unknown as RouterDeps;
+    const handler = new RPCHandler(createRouter(deps));
+    const { response } = await handler.handle(
+      new Request("https://example.test/rpc/integrationSetup/save", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: { provider: "composio", apiKey: "fake-key" } }),
+      }),
+      {
+        prefix: "/rpc",
+        context: {
+          actor: {
+            userId: "member",
+            spaceId: "space",
+            email: "member@rakazo.test",
+            isDeploymentOwner: false,
+          },
+        },
+      },
+    );
+    expect(response.status).toBe(403);
+    expect(save).not.toHaveBeenCalled();
+  });
+});
+
+describe("interrupted computer reservation release", () => {
+  function fixture() {
+    const order: string[] = [];
+    const computerUpdate = {
+      findFirst: vi.fn(async () => ({ id: "update-1", computerId: "computer-1" })),
+      updateMany: vi.fn(async () => {
+        order.push("operation");
+        return { count: 1 };
+      }),
+    };
+    const computer = {
+      updateMany: vi.fn(async () => {
+        order.push("computer");
+        return { count: 1 };
+      }),
+    };
+    const prisma = { computer, computerUpdate, $transaction: vi.fn(async (fn) => fn(prisma)) };
+    const handler = new RPCHandler(
+      createRouter({ prisma, env: { sandboxProvider: "fake" } } as unknown as RouterDeps),
+    );
+    const call = async (owner: boolean, workersStopped?: boolean) =>
+      handler.handle(
+        new Request("http://127.0.0.1/rpc/computer/releaseInterrupted", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ json: { id: "update-1", workersStopped } }),
+        }),
+        {
+          prefix: "/rpc",
+          context: {
+            actor: {
+              spaceId: "space-1",
+              userId: "user-1",
+              email: "user@rakazo.test",
+              isDeploymentOwner: owner,
+            },
+          },
+        },
+      );
+    return { prisma, computer, computerUpdate, order, call };
+  }
+  it.each([
+    { owner: false, stopped: true, status: 403 },
+    { owner: true, stopped: false, status: 400 },
+    { owner: true, stopped: undefined, status: 400 },
+  ])(
+    "requires owner authorization and an explicit stopped-workers assertion: %j",
+    async ({ owner, stopped, status }) => {
+      const { call, prisma } = fixture();
+      const { response } = await call(owner, stopped);
+      expect(response.status).toBe(status);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    },
+  );
+  it("atomically releases only an interrupted reservation in the owner's workspace", async () => {
+    const { call, computer, computerUpdate, order } = fixture();
+    const { response } = await call(true, true);
+    expect(response.status).toBe(200);
+    expect(computerUpdate.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "update-1",
+        status: "interrupted",
+        computer: { spaceId: "space-1", bots: { some: { userId: "user-1", archivedAt: null } } },
+      },
+    });
+    expect(computerUpdate.updateMany).toHaveBeenCalledWith({
+      where: { id: "update-1", status: "interrupted" },
+      data: { status: "failed" },
+    });
+    expect(computer.updateMany).toHaveBeenCalledWith({
+      where: { id: "computer-1", maintenanceId: "update-1" },
+      data: { maintenanceId: null, state: "error" },
+    });
+    expect(order).toEqual(["operation", "computer"]);
   });
 });

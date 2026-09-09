@@ -14,6 +14,7 @@ import type {
 import {
   applyMessagingOutboundStatus,
   ChatSdkMessagingSurface,
+  ComposioConnector,
   type ComposioProvider,
   type ConnectorRegistry,
   createBackgroundJobHandlers,
@@ -35,6 +36,7 @@ import {
   InMemoryJobQueue,
   InMemoryRealtimeFanout,
   InstalledConnectorProvider,
+  IntegrationProviderSettings,
   isComposioEnabled,
   isMessagingSurfaceEnabled,
   isPipedreamEnabled,
@@ -52,6 +54,7 @@ import {
   pushTokenPath,
   type RemoteConnectorDependencies,
   reconcileCloudAgents,
+  reconcileComputerUpdates,
   removePiUserSessions,
   ScriptedAgentRuntime,
   SmtpEmailProvider,
@@ -80,6 +83,7 @@ import { MarkdownMemoryStore } from "@rakazo/memory";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { type AppEnv, loadEnv } from "./env.js";
+import { mountLocalSettings } from "./local-settings.js";
 import {
   createMessagingInboundHandler,
   teamChatSenderCanWakeMessageRoutines,
@@ -88,6 +92,7 @@ import {
 import { mountMessagingWebhookRoutes } from "./messaging-webhook.js";
 import { mountApiRequestBodyLimits } from "./request-body-limit.js";
 import { createRouter } from "./router.js";
+import { mountScreenTarget } from "./screen-proxy.js";
 import { isDeferredReservationLost, TeamChatBridge } from "./team-chat-bridge.js";
 import { ModelTeamChatEngagementJudge } from "./team-chat-judge.js";
 import {
@@ -251,15 +256,24 @@ export async function createApp(
       ? new SmtpEmailProvider({ url: env.smtpUrl, from: env.emailFrom ?? "" })
       : localEmailEmulator);
   const installed = new InstalledConnectorProvider(prisma, secrets, remoteConnectors);
-  const stack = createConnectorStack(isComposioEnabled(env.composioApiKey), composioOverride, [
+  const integrationSettings = new IntegrationProviderSettings(prisma, secrets, env.encryptionKey, {
+    composio:
+      composioOverride ??
+      (isComposioEnabled(env.composioApiKey)
+        ? new ComposioConnector(env.composioApiKey)
+        : undefined),
+    pipedream,
+  });
+  const stack = createConnectorStack(false, composioOverride, [
     installed,
-    ...(pipedream ? [pipedream] : []),
+    ...integrationSettings
+      .providers()
+      .filter((provider) => !composioOverride || provider.describe().id !== "composio"),
     mcp,
   ]);
   const connector = stack.destination;
   await connector.start();
-  void stack.composio?.warmDirectory().catch(() => undefined);
-  void pipedream?.warmDirectory?.().catch(() => undefined);
+  integrationSettings.warmDirectories();
   const runtime =
     env.agentRuntime === "scripted"
       ? new ScriptedAgentRuntime()
@@ -327,7 +341,17 @@ export async function createApp(
     artifacts,
     connector: stack.connector,
     connectors: stack.connector,
-    listConnectedPluginSlugs: stack.composio?.listConnectedSlugs.bind(stack.composio),
+    listConnectedPluginSlugs: async (userId) => {
+      const provider = await integrationSettings.resolve("composio");
+      if (!provider) return [];
+      return provider.listConnectedExternalIds({
+        userId,
+        spaceId: "",
+        operationId: "connections.sync",
+        traceId: "connections.sync",
+        signal: AbortSignal.timeout(15_000),
+      });
+    },
     secrets: [
       env.deploymentModelKey ?? "",
       env.composioApiKey ?? "",
@@ -369,6 +393,7 @@ export async function createApp(
         prisma,
         jobs,
         reconcileCloudAgents: () => reconcileCloudAgents({ prisma, jobs, cloudAgent }),
+        reconcileComputerUpdates: () => reconcileComputerUpdates({ prisma, jobs }),
       })
     : undefined;
   reconciler?.start();
@@ -384,6 +409,7 @@ export async function createApp(
     home,
     secrets,
     oauthLogins,
+    integrationSettings,
     mcpOAuth,
     composio: stack.composio,
     connectors: stack.connector,
@@ -441,6 +467,7 @@ export async function createApp(
     );
   }
   mountApiRequestBodyLimits(app);
+  mountScreenTarget(app, prisma, env.screenProxySecret);
   app.on(["GET", "POST"], "/api/auth/*", async (c) => {
     const path = new URL(c.req.url).pathname.replace("/api/auth", "");
     if (blockedAuthPaths.some((blocked) => path.startsWith(blocked))) {
@@ -448,6 +475,7 @@ export async function createApp(
     }
     return auth.handler(c.req.raw);
   });
+  mountLocalSettings(app, { token: env.desktopStackToken, prisma, rpc });
   app.use("/rpc/*", async (c, next) => {
     const session = await auth.api.getSession({ headers: sessionHeaders(c.req.raw) });
     const requestedSpaceId = c.req.header("x-rakazo-space-id");

@@ -40,6 +40,7 @@ export const ProductEventType = z.enum([
   "effect.reconciled",
   "usage.recorded",
   "bot.spawned",
+  "bot.updated",
   "bot.archived",
   "bot.deleted",
   "group.created",
@@ -126,6 +127,7 @@ export const MessageBlock = z.discriminatedUnion("kind", [
     /** Inline app authorization card (Composio-backed): logo, name, one-line
         description, and an Authorize button that flips to connected. */
     kind: z.literal("app_connect"),
+    connectorId: z.string().optional(),
     provider: z.string(),
     name: z.string(),
     description: z.string(),
@@ -289,7 +291,6 @@ export const ThreadMessageSchema = z.object({
   botId: Id.optional(),
   replyToMessageId: Id.optional(),
   runId: Id.optional(),
-  thumbsUp: z.boolean().optional(),
   createdAt: z.string(),
 });
 export type ThreadMessage = z.infer<typeof ThreadMessageSchema>;
