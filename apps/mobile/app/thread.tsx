@@ -22,6 +22,7 @@ import {
   forwardProbeAfterPage,
   groupVoiceChats,
   isApprovalAskBlock,
+  isPeerReceiptBlocks,
   isRunTerminalEvent,
   isSecretAskBlock,
   latestAnswerableAskMessageId,
@@ -30,12 +31,14 @@ import {
   openThreadWindow,
   plainTextFromMarkdown,
   projectMessageReactions,
+  replyAttachment,
   resolveComposerSendPlan,
   resolvePersonaColorDef,
   SLASH_ACTIONS,
   selectedAskActionLabel,
   serializeComposerPrompt,
   threadWindowMessages,
+  timeSeparatorIds,
   truncateSlashDescription,
   userVisibleMessages,
   withLiveStreamingProgress,
@@ -86,6 +89,8 @@ import { AskActions } from "../components/AskActions";
 import { BotAvatar } from "../components/bot-avatar";
 import { ChoiceCard } from "../components/ChoiceCard";
 import { ComputerCard } from "../components/ComputerCard";
+import { ComposerReplyPreview } from "../components/composer-reply-preview";
+import { FailedSendBubble } from "../components/failed-send-bubble";
 import { GlassSurface } from "../components/glass-surface";
 import type { ImageArtifactPreviewTarget } from "../components/image-artifact-viewer";
 import { InlineImageAttachment } from "../components/inline-image-attachment";
@@ -96,13 +101,17 @@ import { MessageCaption } from "../components/message-caption";
 import { MessageContextMenu } from "../components/message-context-menu";
 import { NativeActionButton } from "../components/native-action-button";
 import { NativeSymbol } from "../components/native-symbol";
+import { ReplyDismissButton } from "../components/reply-dismiss-button";
+import { ReplyLine } from "../components/reply-line";
 import { SelectTextSheet } from "../components/select-text-sheet";
 import { trailingHeaderOptions } from "../components/sheet-header";
+import { TimeSeparator } from "../components/time-separator";
 import { VoiceChatCard } from "../components/VoiceChatCard";
 import { WorkingIndicator } from "../components/WorkingIndicator";
 import type {
   MobileBot,
   MobileGroup,
+  MobileMe,
   MobileMessage,
   MobileMessagePage,
   MobileSnapshot,
@@ -128,6 +137,7 @@ import type { MobileArtifactTarget } from "../lib/artifact-open";
 import { openMobileArtifact } from "../lib/artifact-open";
 import { nextAutoSpeakAction } from "../lib/auto-speak";
 import { confirmDeleteBot, restoreArchivedBot } from "../lib/bot-lifecycle";
+import { findSwitchTarget, ringOnArrival, takeRingOnArrival } from "../lib/bot-switch";
 import { setCallProviderTranscribe, startCall, useCallSession } from "../lib/call-session";
 import { transparentColor } from "../lib/color";
 import { loadDeviceVoiceEnabled } from "../lib/device-voice";
@@ -165,14 +175,21 @@ import {
   getCachedResponseStreamingEnabled,
   subscribeResponseStreaming,
 } from "../lib/response-streaming";
+import { secretDestinationLabel } from "../lib/secret-destination";
 import { selectableTextFromMarkdown } from "../lib/selectable-text";
+import type { ComposerSnapshot, SendAttempt } from "../lib/thread-feedback";
+import { deliverSend, settleComposer, useThreadFeedback } from "../lib/thread-feedback";
 import { ThreadJumpAnchor } from "../lib/thread-jump";
 import { ThreadReadOnlyContext } from "../lib/thread-read-only";
 import type { ThreadScrollAction, ThreadScrollState } from "../lib/thread-scroll";
 import { ThreadScrollBehavior } from "../lib/thread-scroll";
 import { errorText } from "../lib/user-error";
 import { speakQueue, speakText } from "../lib/voice";
-import { probeProviderTranscribe, resolveVoiceCallPlan } from "../lib/voice-call-entry";
+import {
+  loadCallCallerName,
+  probeProviderTranscribe,
+  resolveVoiceCallPlan,
+} from "../lib/voice-call-entry";
 
 type PendingAttachment = PickedAttachment & { threadKey: string };
 type AskAction = NonNullable<Extract<MessageBlock, { kind: "ask" }>["actions"]>[number];
@@ -475,6 +492,9 @@ function Thread() {
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [agentSkills, setAgentSkills] = useState<AgentSkillCatalogEntry[]>([]);
   const [mentionBots, setMentionBots] = useState<MobileBot[]>([]);
+  // The call outlives renders, so its switch check reads the newest bot list from here.
+  const mentionBotsRef = useRef<MobileBot[]>([]);
+  mentionBotsRef.current = mentionBots;
   const [mentionGroups, setMentionGroups] = useState<MobileGroup[]>([]);
   const [mentionRoutines, setMentionRoutines] = useState<Array<Routine & { botName?: string }>>([]);
   const [mentionConnectors, setMentionConnectors] = useState<
@@ -493,7 +513,9 @@ function Thread() {
   const [quoteTarget, setQuoteTarget] = useState<MobileMessage | null>(null);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const pendingDeliveries = useRef(0);
+  const feedback = useThreadFeedback(threadKey, newClientNonce);
+  const { error, setError } = feedback;
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [selectableText, setSelectableText] = useState<string | null>(null);
   const [loadingNewer, setLoadingNewer] = useState(false);
@@ -525,6 +547,16 @@ function Thread() {
   const visibleMessages = reactionView.visibleMessages;
   const latestMessageId = visibleMessages.at(-1)?.id ?? null;
   const activePendingAttachments = attachmentsForThread(pendingAttachments, threadKey);
+  const composerSnapshot: ComposerSnapshot = {
+    promptText: serializeComposerPrompt(draft, selectedSkill, selectedMentions),
+    mentions: selectedMentions,
+    skill: selectedSkill,
+    replyTargetId: replyTarget?.id,
+    replyQuote,
+    attachmentIds: activePendingAttachments.map((attachment) => attachment.id),
+  };
+  const composerRef = useRef(composerSnapshot);
+  composerRef.current = composerSnapshot;
   const composerMentionTargets = useMemo(
     () =>
       buildComposerMentionOptions({
@@ -877,7 +909,6 @@ function Thread() {
 
   function clearConversation() {
     if (!botId) return;
-    setError(null);
     void rpc("threads/clear", { botId })
       .then(() => {
         expandedHistoryThread.current = null;
@@ -889,7 +920,9 @@ function Thread() {
             : snapRef.current,
         );
       })
-      .catch((err: unknown) => setError(errorText(err, t("Could not clear conversation"))));
+      .catch((err: unknown) =>
+        Alert.alert(t("Could not clear conversation"), errorText(err, t("Try again."))),
+      );
   }
 
   const botActions = [
@@ -990,6 +1023,9 @@ function Thread() {
       commitSnap(
         mergeMobileSnapshot(snapRef.current, next, expandedHistoryThread.current === next.threadId),
       );
+    }
+    if (isCurrentTarget(targetBotId, targetGroupId)) {
+      feedback.refreshed(targetGroupId ?? targetBotId);
     }
     return result.snapshot ?? undefined;
   }
@@ -1417,10 +1453,6 @@ function Thread() {
     if (selectedSkill) setSelectedSkill(null);
   }
 
-  function serializeComposerPromptText(): string {
-    return serializeComposerPrompt(draft, selectedSkill, selectedMentions);
-  }
-
   function runSlashAction(action: SlashActionId) {
     setDraft("");
     setSlashQuery(null);
@@ -1458,130 +1490,95 @@ function Thread() {
     const initialGroupTarget = groupId;
     if ((!initialBotTarget && !initialGroupTarget) || sending) return;
     const originThreadKey = initialGroupTarget ?? initialBotTarget;
+    const submitted = composerSnapshot;
     const attachments = attachmentsForThread(pendingAttachments, originThreadKey);
     const plan = resolveComposerSendPlan({
-      text: serializeComposerPromptText(),
+      text: submitted.promptText,
       mentions: selectedMentions,
       hasAttachments: attachments.length > 0,
     });
     if (plan.isNoOp) return;
+    const typedSwitch =
+      initialBotTarget && attachments.length === 0
+        ? findSwitchTarget(plan.trimmed, mentionBotsRef.current)
+        : undefined;
+    if (typedSwitch && typedSwitch.id !== initialBotTarget) {
+      openBotChat(typedSwitch, false);
+      return;
+    }
     const reroutedToGroup = Boolean(
       plan.rerouteGroupId && plan.rerouteGroupId !== initialGroupTarget,
     );
     const groupTarget = plan.rerouteGroupId ?? initialGroupTarget;
     const botTarget = reroutedToGroup ? undefined : initialBotTarget;
-    const trimmed = plan.trimmed;
-    const dropDelayedSetup = () => {
-      // Only after successful engagement so a failed upload/send keeps the setup card.
-      // Covers group-mention reroute while the bot thread stays mounted underneath.
-      if (initialBotTarget) cancelFocusPrompt(initialBotTarget);
-    };
-    setSending(true);
-    setError(null);
-    try {
-      if (plan.shouldRunRoutines) {
-        const sendNonce = newClientNonce();
-        await Promise.all(
-          plan.routineIds.map((routineId) =>
-            rpc("routines/testRun", {
-              routineId,
-              clientNonce: `routine-mention:${sendNonce}:${routineId}`,
-            }),
-          ),
-        );
-      }
-      const clearOriginComposer = () => {
-        setPendingAttachments((current) =>
-          current.filter((attachment) => attachment.threadKey !== originThreadKey),
-        );
-        setDraft("");
-        setMentionQuery(null);
-        setSlashQuery(null);
-        setSelectedSkill(null);
-        setSelectedMentions([]);
-        setReplyTarget(null);
-        setReplyQuote(null);
-        setAttachmentNotice(null);
-      };
-      if (!plan.shouldSend) {
-        dropDelayedSetup();
-        clearOriginComposer();
-        if (reroutedToGroup && groupTarget) {
-          router.push({
-            pathname: "/group-thread",
-            params: {
-              groupId: groupTarget,
-              name: plan.rerouteGroupName ?? t("Group"),
-            },
-          });
-          return;
-        }
-        if (isCurrentTarget(botTarget, groupTarget)) {
-          await refresh();
-        }
-        return;
-      }
-      const artifactIds: string[] = [];
-      for (const pending of attachments) {
-        const artifact = await rpc<{ id: string }>("artifacts/create", {
-          ...(groupTarget ? { groupId: groupTarget } : { botId: botTarget! }),
-          name: pending.name,
-          mimeType: pending.mimeType,
-          contentBase64: pending.contentBase64,
-        });
-        artifactIds.push(artifact.id);
-      }
-      const clientNonce = newClientNonce();
-      await rpc(
-        "threads/send",
-        groupTarget
-          ? {
-              groupId: groupTarget,
-              clientNonce,
-              text: trimmed || undefined,
-              mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
-              artifactIds: artifactIds.length ? artifactIds : undefined,
-              replyToMessageId: reroutedToGroup ? undefined : replyTarget?.id,
-              replyQuote: reroutedToGroup ? undefined : (replyQuote ?? undefined),
-            }
-          : {
-              botId: botTarget!,
-              clientNonce,
-              text: trimmed || undefined,
-              mentions: plan.mentionPayload.length ? plan.mentionPayload : undefined,
-              artifactIds: artifactIds.length ? artifactIds : undefined,
-              replyToMessageId: replyTarget?.id,
-              replyQuote: replyQuote ?? undefined,
-            },
+    const attempt = feedback.sendAttempt({
+      originThreadKey: originThreadKey!,
+      displayText: submitted.promptText,
+      replyPreview: replyQuote ?? (replyTarget ? previewMessageText(replyTarget) : null),
+      initialBotTarget,
+      botTarget,
+      groupTarget,
+      reroutedToGroup,
+      plan,
+      attachments: attachments.map((attachment) => ({ ...attachment })),
+      replyTargetId: replyTarget?.id,
+      replyQuote,
+    });
+    await deliver(attempt, () => {
+      if (originThreadKey !== (activeGroupId.current ?? activeBotId.current)) return;
+      const settled = settleComposer(submitted, composerRef.current);
+      setPendingAttachments((current) =>
+        current.filter((attachment) => !submitted.attachmentIds.includes(attachment.id)),
       );
-      dropDelayedSetup();
-      void loadSessionToken()
-        .then((token) => resumeLiveNotifications(currentApiBase(), token, selectedSpaceId() ?? ""))
-        .catch(() => undefined);
-      clearOriginComposer();
-      if (reroutedToGroup && groupTarget) {
-        router.push({
-          pathname: "/group-thread",
-          params: {
-            groupId: groupTarget,
-            name: plan.rerouteGroupName ?? t("Group"),
-          },
-        });
-        return;
-      }
-      if (isCurrentTarget(botTarget, groupTarget)) {
-        // A sent message lands at the latest end, past an older page opened from search.
-        if (pinnedAroundRef.current) showLatest();
-        void refresh().catch(() => undefined);
-      }
+      if (!settled.clearComposer) return;
+      setDraft("");
+      setMentionQuery(null);
+      setSlashQuery(null);
+      setSelectedSkill(null);
+      setSelectedMentions([]);
+      setReplyTarget(null);
+      setReplyQuote(null);
+      setAttachmentNotice(null);
+    });
+  }
+
+  async function deliver(attempt: SendAttempt, onSettled?: () => void) {
+    if (readOnly || !feedback.start(attempt)) return;
+    const { initialBotTarget, botTarget, groupTarget, reroutedToGroup, plan } = attempt.payload;
+    pendingDeliveries.current += 1;
+    setSending(true);
+    try {
+      await deliverSend(attempt.payload, attempt, rpc);
     } catch (err) {
-      if (reroutedToGroup && groupTarget) {
-        setError(errorText(err, t("Failed to send message")));
-      } else if (isCurrentTarget(botTarget, groupTarget)) {
-        setError(errorText(err, t("Failed to send message")));
+      attempt.error = errorText(err, t("Failed to send message"));
+      feedback.sendFailed(attempt);
+      if (attempt.payload.originThreadKey === (activeGroupId.current ?? activeBotId.current)) {
+        if (pinnedAroundRef.current) showLatest();
+        performScroll(scrollBehavior.current.jumpToLatest());
+        setThreadScrollState(scrollBehavior.current.state());
       }
+      return;
     } finally {
-      setSending(false);
+      onSettled?.();
+      pendingDeliveries.current -= 1;
+      setSending(pendingDeliveries.current > 0);
+    }
+    feedback.sent(attempt);
+    if (initialBotTarget) cancelFocusPrompt(initialBotTarget);
+    void loadSessionToken()
+      .then((token) => resumeLiveNotifications(currentApiBase(), token, selectedSpaceId() ?? ""))
+      .catch(() => undefined);
+    if (attempt.payload.originThreadKey !== (activeGroupId.current ?? activeBotId.current)) return;
+    if (reroutedToGroup && groupTarget) {
+      router.push({
+        pathname: "/group-thread",
+        params: { groupId: groupTarget, name: plan.rerouteGroupName ?? t("Group") },
+      });
+      return;
+    }
+    if (isCurrentTarget(botTarget, groupTarget)) {
+      if (pinnedAroundRef.current) showLatest();
+      void refresh().catch(() => undefined);
     }
   }
 
@@ -1591,7 +1588,6 @@ function Thread() {
     const targetGroupId = groupId;
     if ((!targetBotId && !targetGroupId) || sending) return;
     setSending(true);
-    setError(null);
     try {
       await rpc(
         "threads/stop",
@@ -1599,7 +1595,7 @@ function Thread() {
       );
     } catch (err) {
       if (isCurrentTarget(targetBotId, targetGroupId)) {
-        setError(errorText(err, t("Failed to stop work")));
+        Alert.alert(t("Failed to stop work"), errorText(err, t("Try again.")));
       }
       setSending(false);
       return;
@@ -1670,7 +1666,10 @@ function Thread() {
       void speakQueue(items)
         .then((spoken) => {
           if (!spoken)
-            Alert.alert(t("Could not speak"), t("Add a voice provider in Voice settings."));
+            Alert.alert(t("Could not speak"), t("Add a voice provider in Voice settings."), [
+              { text: t("Cancel"), style: "cancel" },
+              { text: t("Open Voice"), onPress: () => router.push("/voice") },
+            ]);
         })
         .catch((err: unknown) =>
           Alert.alert(t("Could not speak"), errorText(err, t("Try again."))),
@@ -1679,18 +1678,34 @@ function Thread() {
     [botId, displayName, mentionBots, snap?.members, visibleMessages],
   );
 
-  async function startVoiceCall() {
+  /** A bot the caller was put through to answers ("Max here. Hi Riley."); a fresh call opens with hello. */
+  function callGreeting(botName: string, callerName: string | undefined, switchedHere: boolean) {
+    if (switchedHere) {
+      return callerName
+        ? t("{bot} here. Hi {name}.", { bot: botName, name: callerName })
+        : t("{bot} here.", { bot: botName });
+    }
+    return callerName
+      ? t("Hello {name}, {bot} here.", { name: callerName, bot: botName })
+      : t("Hello, {bot} here.", { bot: botName });
+  }
+
+  /** `switchedHere`: the caller asked another bot to put them through, so this bot answers. */
+  async function startVoiceCall(switchedHere = false) {
     if (readOnly) return;
     const targetBotId = botId;
     if (!targetBotId || voiceCallStarting.current) return;
     voiceCallStarting.current = true;
     const loadVoiceStatus = () => rpc<{ ready: boolean; transcribe: boolean }>("voice/status");
     try {
-      const plan = await resolveVoiceCallPlan({
-        loadDeviceVoiceEnabled,
-        dictationAvailable,
-        loadVoiceStatus,
-      });
+      const [plan, callerName] = await Promise.all([
+        resolveVoiceCallPlan({
+          loadDeviceVoiceEnabled,
+          dictationAvailable,
+          loadVoiceStatus,
+        }),
+        loadCallCallerName(() => rpc<MobileMe>("me")),
+      ]);
       if (activeBotId.current !== targetBotId) return;
       if (plan.kind === "settings") {
         router.push("/voice");
@@ -1707,11 +1722,18 @@ function Thread() {
         );
         return;
       }
+      const botName = displayName ?? t("Bot");
       const startedCallId = startCall({
         botId: targetBotId,
-        botName: displayName ?? t("Bot"),
+        botName,
         botColor: mentionBots.find((bot) => bot.id === targetBotId)?.color,
         transcribe: plan.transcribe,
+        greeting: callGreeting(botName, callerName, switchedHere),
+        switchBot: (text) => {
+          const target = findSwitchTarget(text, mentionBotsRef.current);
+          if (!target || target.id === targetBotId) return undefined;
+          return { name: target.name, ring: () => openBotChat(target, true) };
+        },
       });
       if (plan.kind === "device") {
         void probeProviderTranscribe(loadVoiceStatus)
@@ -1726,6 +1748,16 @@ function Thread() {
       voiceCallStarting.current = false;
     }
   }
+
+  /** Opens another bot's chat in place of this one, ringing it when the switch came from a call. */
+  function openBotChat(target: MobileBot, ring: boolean): void {
+    if (ring) ringOnArrival(target.id);
+    router.replace({ pathname: "/thread", params: { botId: target.id, name: target.name } });
+  }
+
+  useEffect(() => {
+    if (botId && takeRingOnArrival(botId)) void startVoiceCall(true);
+  }, [botId]);
 
   const attachActions: MenuAction[] = [
     { id: "library", title: t("Photo library"), image: "photo.on.rectangle" },
@@ -1769,6 +1801,15 @@ function Thread() {
 
   const answerableAskMessageId = latestAnswerableAskMessageId(snap);
   const runError = snap?.run?.status === "failed" ? (snap.run.error ?? null) : null;
+  const separatorIds = timeSeparatorIds(visibleMessages);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (highlightTimer.current) clearTimeout(highlightTimer.current);
+    },
+    [],
+  );
   // Group calls in reading order, then reverse for the inverted list.
   const liveItems = useMemo(() => groupVoiceChats(visibleMessages).reverse(), [visibleMessages]);
   const messagesById = useMemo(
@@ -1862,7 +1903,7 @@ function Thread() {
       });
     } catch (err) {
       if (!isCurrentTarget(targetBotId, targetGroupId)) return;
-      setError(errorText(err, t("Could not update reaction")));
+      Alert.alert(t("Could not update reaction"), errorText(err, t("Try again.")));
     }
   }
 
@@ -1977,6 +2018,17 @@ function Thread() {
     options?: { enableJump?: boolean; index?: number },
   ) {
     const { actionProps, menu, onMenuAction } = messageActionProps(message);
+    const parent = message.replyToMessageId
+      ? messagesById.get(message.replyToMessageId)
+      : undefined;
+    const replyBotId = message.replyPreview?.botId ?? parent?.botId;
+    const replyAuthor =
+      (message.replyPreview?.role ?? parent?.role) === "user"
+        ? t("You")
+        : (memberName(snap?.members, replyBotId) ??
+          mentionBots.find((bot) => bot.id === replyBotId)?.name ??
+          displayName ??
+          t("Bot"));
     const messageReactions = reactionView.reactions.get(message.id);
     const activityBotId =
       !inGroup && message.role === "bot" && message.id.startsWith("progress:")
@@ -2005,6 +2057,9 @@ function Thread() {
                 );
                 if (offset == null) return;
                 scrollPinnedTo(offset);
+                setHighlightedMessageId(message.id);
+                if (highlightTimer.current) clearTimeout(highlightTimer.current);
+                highlightTimer.current = setTimeout(() => setHighlightedMessageId(null), 1200);
                 requestAnimationFrame(() => {
                   const again = jumpAnchor.current.align(headerHeight + 24);
                   if (again != null) scrollPinnedTo(again);
@@ -2013,116 +2068,134 @@ function Thread() {
             : undefined
         }
         style={{
+          backgroundColor: highlightedMessageId === message.id ? tokens.muted : undefined,
           marginTop: 12,
           width: "100%",
-          flexDirection: "row",
-          alignItems: "flex-start",
-          gap: 8,
-          justifyContent: message.role === "user" ? "flex-end" : "flex-start",
         }}
       >
-        {activityBotId ? (
-          <View style={{ paddingTop: 22 }}>
-            <BotAvatar
-              color={activityBot?.color ?? tokens.mutedForeground}
-              identity={activityBotId}
-              size={inGroup ? 20 : 28}
-              status={activityStatus}
-            />
-          </View>
-        ) : null}
+        {separatorIds.has(message.id) ? <TimeSeparator createdAt={message.createdAt} /> : null}
         <View
           style={{
-            width: isCenteredAgentEvent(message.blocks) ? "100%" : undefined,
-            maxWidth: isCenteredAgentEvent(message.blocks)
-              ? "100%"
-              : activityBotId
-                ? undefined
-                : "90%",
-            flex: activityBotId ? 1 : undefined,
-            flexShrink: 1,
+            width: "100%",
+            flexDirection: "row",
+            alignItems: "flex-start",
+            gap: 8,
+            justifyContent: message.role === "user" ? "flex-end" : "flex-start",
           }}
         >
-          <MessageContextMenu
-            actions={menu}
-            maxWidth={
-              isCenteredAgentEvent(message.blocks)
-                ? windowWidth - 40
-                : activityBotId
-                  ? windowWidth - 40 - (inGroup ? 28 : 36)
-                  : (windowWidth - 40) * 0.9
-            }
-            colorScheme={colorScheme}
-            onAction={onMenuAction}
-            onLongPress={actionProps.onLongPress}
-          >
-            <ThreadReadOnlyContext.Provider value={readOnly}>
-              <MessageBubble
-                botId={botId ?? snap?.members?.[0]?.botId ?? ""}
-                groupId={groupId}
-                message={message}
-                botName={displayName}
-                bots={mentionBots}
-                members={snap?.members}
-                replyPreview={
-                  message.replyToMessageId ? messagesById.get(message.replyToMessageId) : undefined
-                }
-                canAnswer={!readOnly && message.id === answerableAskMessageId}
-                onAnswer={answerMessage}
-                onOpenBot={openBot}
-                onOpenComputer={openComputer}
-                onChoiceDismissed={(question) => {
-                  setDismissedChoiceQuestions((current) => {
-                    const existing = current.get(message.id);
-                    if (existing?.has(question)) return current;
-                    const next = new Map(current);
-                    const questions = new Set(existing);
-                    questions.add(question);
-                    next.set(message.id, questions);
-                    return next;
-                  });
-                }}
-                onPreviewMarkdown={setMarkdownPreview}
-                onPreviewImage={(target) =>
-                  router.push({
-                    pathname: "/image",
-                    params: { ...target, ...(groupId ? { groupId } : { botId }) },
-                  })
-                }
-                actionProps={actionProps}
+          {activityBotId ? (
+            <View style={{ paddingTop: 22 }}>
+              <BotAvatar
+                color={activityBot?.color ?? tokens.mutedForeground}
+                identity={activityBotId}
+                size={inGroup ? 20 : 28}
+                status={activityStatus}
               />
-            </ThreadReadOnlyContext.Provider>
-          </MessageContextMenu>
-          {messageReactions ? (
-            <View
-              style={{
-                flexDirection: "row",
-                flexWrap: "wrap",
-                gap: 4,
-                marginTop: 4,
-                justifyContent: message.role === "user" ? "flex-end" : "flex-start",
-              }}
-            >
-              {[...messageReactions].map(([emoji, count]) => (
-                <Text
-                  key={emoji}
-                  style={{
-                    color: tokens.foreground,
-                    backgroundColor: tokens.muted,
-                    borderColor: tokens.border,
-                    borderWidth: 1,
-                    borderRadius: 16,
-                    paddingHorizontal: 8,
-                    paddingVertical: 2,
-                    fontSize: 13,
-                  }}
-                >
-                  {emoji}
-                  {count > 1 ? ` ${count}` : ""}
-                </Text>
-              ))}
             </View>
           ) : null}
+          <View
+            style={{
+              width: isCenteredAgentEvent(message.blocks) ? "100%" : undefined,
+              maxWidth: isCenteredAgentEvent(message.blocks)
+                ? "100%"
+                : activityBotId
+                  ? undefined
+                  : "90%",
+              flex: activityBotId ? 1 : undefined,
+              flexShrink: 1,
+            }}
+          >
+            {isPeerReceiptBlocks(message.blocks) ? null : (
+              <ReplyLine
+                threadTarget={artifactTarget}
+                targetId={message.replyToMessageId}
+                quote={message.replyQuote}
+                preview={message.replyPreview}
+                author={replyAuthor}
+                fallbackText={parent ? previewMessageText(parent) : undefined}
+                onJump={(messageId) => {
+                  void applyMessageJump({ botId, groupId, messageId }).catch(() => undefined);
+                }}
+              />
+            )}
+            <MessageContextMenu
+              actions={menu}
+              maxWidth={
+                isCenteredAgentEvent(message.blocks)
+                  ? windowWidth - 40
+                  : activityBotId
+                    ? windowWidth - 40 - (inGroup ? 28 : 36)
+                    : (windowWidth - 40) * 0.9
+              }
+              colorScheme={colorScheme}
+              onAction={onMenuAction}
+              onLongPress={actionProps.onLongPress}
+            >
+              <ThreadReadOnlyContext.Provider value={readOnly}>
+                <MessageBubble
+                  botId={botId ?? snap?.members?.[0]?.botId ?? ""}
+                  groupId={groupId}
+                  message={message}
+                  botName={displayName}
+                  bots={mentionBots}
+                  members={snap?.members}
+                  canAnswer={!readOnly && message.id === answerableAskMessageId}
+                  onAnswer={answerMessage}
+                  onOpenBot={openBot}
+                  onOpenComputer={openComputer}
+                  onChoiceDismissed={(question) => {
+                    setDismissedChoiceQuestions((current) => {
+                      const existing = current.get(message.id);
+                      if (existing?.has(question)) return current;
+                      const next = new Map(current);
+                      const questions = new Set(existing);
+                      questions.add(question);
+                      next.set(message.id, questions);
+                      return next;
+                    });
+                  }}
+                  onPreviewMarkdown={setMarkdownPreview}
+                  onPreviewImage={(target) =>
+                    router.push({
+                      pathname: "/image",
+                      params: { ...target, ...(groupId ? { groupId } : { botId }) },
+                    })
+                  }
+                  actionProps={actionProps}
+                />
+              </ThreadReadOnlyContext.Provider>
+            </MessageContextMenu>
+            {messageReactions ? (
+              <View
+                style={{
+                  flexDirection: "row",
+                  flexWrap: "wrap",
+                  gap: 4,
+                  marginTop: 4,
+                  justifyContent: message.role === "user" ? "flex-end" : "flex-start",
+                }}
+              >
+                {[...messageReactions].map(([emoji, count]) => (
+                  <Text
+                    key={emoji}
+                    style={{
+                      color: tokens.foreground,
+                      backgroundColor: tokens.muted,
+                      borderColor: tokens.border,
+                      borderWidth: 1,
+                      borderRadius: 16,
+                      paddingHorizontal: 8,
+                      paddingVertical: 2,
+                      fontSize: 13,
+                    }}
+                  >
+                    {emoji}
+                    {count > 1 ? ` ${count}` : ""}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+          </View>
         </View>
       </View>
     );
@@ -2198,6 +2271,15 @@ function Thread() {
       </Pressable>
     ) : null;
 
+  const failedSendBubbles = feedback.failedSends.map((attempt) => (
+    <FailedSendBubble
+      key={attempt.clientNonce}
+      attempt={attempt}
+      onRetry={() => void deliver(attempt)}
+      onDelete={() => feedback.discard(attempt)}
+    />
+  ));
+
   return (
     <KeyboardAvoidingView
       behavior="height"
@@ -2266,6 +2348,7 @@ function Thread() {
             {threadWindowMessages(visibleMessages, pinnedNewerCursor).map((message, index) =>
               renderMessageRow(message, { enableJump: true, index }),
             )}
+            {pinnedNewerCursor === null ? failedSendBubbles : null}
             {pinnedNewerCursor === null ? (
               workingFooter
             ) : loadingNewer ? (
@@ -2317,10 +2400,18 @@ function Thread() {
               setThreadScrollState(scrollBehavior.current.state());
             }}
             ListFooterComponent={loadEarlierControl}
-            ListHeaderComponent={workingFooter}
+            ListHeaderComponent={
+              <>
+                {failedSendBubbles}
+                {workingFooter}
+              </>
+            }
             renderItem={({ item }) =>
               item.kind === "voiceChat" ? (
                 <View style={{ marginTop: 12, width: "100%" }}>
+                  {item.messages[0] && separatorIds.has(item.messages[0].id) ? (
+                    <TimeSeparator createdAt={item.messages[0].createdAt} />
+                  ) : null}
                   <VoiceChatCard group={item} />
                 </View>
               ) : (
@@ -2420,30 +2511,23 @@ function Thread() {
               paddingVertical: 10,
             }}
           >
-            <View style={{ flex: 1 }}>
-              <Text style={{ color: tokens.mutedForeground, fontSize: 12 }}>
-                {t("Replying to")}
-              </Text>
-              <Text style={{ color: tokens.foreground, fontSize: 13 }} numberOfLines={1}>
-                {replyQuote ? `“${replyQuote}”` : previewMessageText(replyTarget)}
-              </Text>
-            </View>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={t("Cancel reply")}
-              hitSlop={8}
+            <ComposerReplyPreview
+              author={
+                replyTarget.role === "user"
+                  ? t("You")
+                  : (memberName(snap?.members, replyTarget.botId) ?? displayName ?? t("Bot"))
+              }
+              quote={replyQuote}
+              text={previewMessageText(replyTarget)}
+              attachment={replyAttachment(replyTarget.blocks)}
+              threadTarget={artifactTarget}
+            />
+            <ReplyDismissButton
               onPress={() => {
                 setReplyTarget(null);
                 setReplyQuote(null);
               }}
-            >
-              <NativeSymbol
-                ios="xmark.circle.fill"
-                android="close-circle"
-                size={20}
-                color={tokens.mutedForeground}
-              />
-            </Pressable>
+            />
           </GlassSurface>
         ) : null}
         {attachmentNotice ? (
@@ -3148,9 +3232,9 @@ function previewMessageText(message: MobileMessage): string {
     .join(" ")
     .trim();
   if (text) return text;
-  if (message.blocks.some((block) => block.kind === "image" || block.kind === "file")) {
-    return t("Attachment");
-  }
+  const attachment = replyAttachment(message.blocks);
+  if (attachment)
+    return attachment.kind === "image" ? t("Photo") : attachment.name || t("Attachment");
   return t("Message");
 }
 
@@ -3187,7 +3271,6 @@ const MessageBubble = memo(function MessageBubble({
   groupId,
   message,
   members,
-  replyPreview,
   canAnswer,
   onAnswer,
   onOpenBot,
@@ -3203,7 +3286,6 @@ const MessageBubble = memo(function MessageBubble({
   groupId?: string;
   message: MobileMessage;
   members?: MobileSnapshot["members"];
-  replyPreview?: MobileMessage;
   canAnswer: boolean;
   onAnswer: (message: MobileMessage, answer: string, username?: string) => Promise<void>;
   onOpenBot: (botId: string, name: string) => void;
@@ -3670,21 +3752,6 @@ const MessageBubble = memo(function MessageBubble({
             {speaker}
           </Text>
         ) : null}
-        {replyPreview || (message.replyToMessageId && message.replyQuote) ? (
-          <Text
-            style={{
-              color: message.role === "user" ? tokens.secondaryForeground : tokens.mutedForeground,
-              fontSize: 12.5,
-            }}
-            numberOfLines={2}
-          >
-            {message.replyQuote
-              ? `“${message.replyQuote}”`
-              : replyPreview
-                ? previewMessageText(replyPreview)
-                : ""}
-          </Text>
-        ) : null}
         {caption ? (
           <MessageCaption
             role={message.role}
@@ -3829,7 +3896,6 @@ const MessageBubble = memo(function MessageBubble({
           message={{ ...message, blocks: segment.blocks }}
           speaker={index === firstContent ? speaker : undefined}
           speakerColor={index === firstContent ? speakerColor : undefined}
-          replyPreview={index === firstContent ? replyPreview : undefined}
           actionProps={actionProps}
         />
       ))}
@@ -3871,13 +3937,11 @@ function MessageTextCard({
   message,
   speaker,
   speakerColor,
-  replyPreview,
   actionProps,
 }: {
   message: MobileMessage;
   speaker?: string;
   speakerColor?: string;
-  replyPreview?: MobileMessage;
   actionProps: MessageActionProps;
 }) {
   const colorScheme = useResolvedAppearance();
@@ -3906,22 +3970,6 @@ function MessageTextCard({
           }}
         >
           {speaker}
-        </Text>
-      ) : null}
-      {replyPreview || (message.replyToMessageId && message.replyQuote) ? (
-        <Text
-          style={{
-            color: message.role === "user" ? tokens.secondaryForeground : tokens.mutedForeground,
-            fontSize: 12.5,
-            marginBottom: 6,
-          }}
-          numberOfLines={2}
-        >
-          {message.replyQuote
-            ? `“${message.replyQuote}”`
-            : replyPreview
-              ? previewMessageText(replyPreview)
-              : ""}
         </Text>
       ) : null}
       <MessageCaption
@@ -4062,7 +4110,7 @@ function AskBlock({
       </Text>
       {secretInput && ask.credential ? (
         <Text style={{ color: tokens.mutedForeground, fontSize: 13.5 }}>
-          {ask.credential.origin}
+          {secretDestinationLabel(ask.credential)}
         </Text>
       ) : null}
       {ask.detail && !secretInput ? (
